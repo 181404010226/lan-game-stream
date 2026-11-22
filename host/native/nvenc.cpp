@@ -80,6 +80,7 @@ extern "C" int lan_nvenc_create(void* device, void* texture, unsigned width, uns
     h264.disableSPSPPS = 0;
     h264.chromaFormatIDC = 1;
     h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
+    h264.h264VUIParameters.videoFullRangeFlag = 0;
     h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
     h264.h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
     h264.h264VUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
@@ -106,7 +107,7 @@ extern "C" int lan_nvenc_create(void* device, void* texture, unsigned width, uns
     register_texture.resourceToRegister = texture;
     register_texture.width = width;
     register_texture.height = height;
-    register_texture.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+    register_texture.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
     register_texture.bufferUsage = NV_ENC_INPUT_IMAGE;
     status = api.nvEncRegisterResource(session->encoder, &register_texture);
     if (status != NV_ENC_SUCCESS) return failure(session, 7, status);

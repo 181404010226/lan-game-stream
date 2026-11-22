@@ -288,7 +288,7 @@ fn nvidia_device() -> Result<(ID3D11Device, ID3D11DeviceContext, String)> {
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -353,7 +353,7 @@ fn input_texture(device: &ID3D11Device, size: (u32, u32)) -> Result<ID3D11Textur
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
         ..Default::default()
     };
     let mut texture = None;
@@ -379,16 +379,16 @@ fn capture(
         .next(Duration::from_secs(2))
         .context("NVIDIA D3D11 取画没有首帧")?;
     let (source, area) = texture_and_crop(target, &first)?;
-    let size = (area.right - area.left, area.bottom - area.top);
-    if output_size(size.0, size.1, quality) != size {
-        bail!("当前窗口需要额外缩放");
-    }
-    let texture = input_texture(&device, size)?;
+    let source_size = (area.right - area.left, area.bottom - area.top);
+    let size = output_size(source_size.0, source_size.1, quality);
+    let texture = input_texture(&device, source_size)?;
+    let converter = Nv12Converter::new(&device, &context, &texture, source_size, size, fps)?;
     unsafe {
         context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &source, 0, Some(&area));
     }
     drop(first);
-    let encoder = TextureEncoder::new(&device, &texture, size, fps)?;
+    converter.convert()?;
+    let encoder = TextureEncoder::new(&device, converter.texture(), size, fps)?;
     let seed = encoder.picture(0, true)?;
     if seed.is_empty() {
         bail!("NVENC D3D11 没有立即输出首帧");
@@ -401,7 +401,7 @@ fn capture(
         .send(Ok((size, adapter)))
         .context("接收端已取消启动")?;
     let mut probe = detect_bars
-        .then(|| EdgeProbe::new(&device, size))
+        .then(|| EdgeProbe::new(&device, source_size))
         .transpose()?;
     let mut bars = BlackBars::default();
     let mut sampled = Instant::now() - Duration::from_secs(1);
@@ -423,12 +423,13 @@ fn capture(
         let capture_start = Instant::now();
         if let Some(frame) = frames.next(Duration::ZERO) {
             let (source, area) = texture_and_crop(target, &frame)?;
-            if (area.right - area.left, area.bottom - area.top) != size {
+            if (area.right - area.left, area.bottom - area.top) != source_size {
                 bail!("游戏窗口尺寸已变化，请重新连接");
             }
             unsafe {
                 context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &source, 0, Some(&area));
             }
+            converter.convert()?;
         }
         let bytes = encoder.picture(index, force_keyframe)?;
         if bytes.is_empty() {
@@ -588,3 +589,87 @@ fn read_samples(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod gpu_color_test {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a local NVIDIA D3D11 and NVENC driver"]
+    fn nv12_preserves_neutral_and_saturated_color_patches() {
+        let _runtime = Runtime::initialize().unwrap();
+        let (device, context, _) = nvidia_device().unwrap();
+        let size = (320_u32, 192_u32);
+        let texture = input_texture(&device, size).unwrap();
+        let converter = Nv12Converter::new(&device, &context, &texture, size, size, 120).unwrap();
+        let encoder = TextureEncoder::new(&device, converter.texture(), size, 120).unwrap();
+        let samples: [[u8; 3]; 8] = [
+            [0, 0, 0],
+            [32, 32, 32],
+            [128, 128, 128],
+            [255, 255, 255],
+            [220, 35, 35],
+            [35, 220, 35],
+            [35, 35, 220],
+            [35, 200, 220],
+        ];
+        let mut output = Vec::new();
+        let diagnostic = StagingTexture::new(
+            &device,
+            size.0,
+            size.1,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
+        )
+        .unwrap();
+        for frame in 0..18_u32 {
+            let mut pixels = Vec::with_capacity((size.0 * size.1 * 4) as usize);
+            for y in 0..size.1 {
+                for x in 0..size.0 {
+                    let [r, g, b] = if y > 136 && (frame * 10..frame * 10 + 36).contains(&x) {
+                        [200, 40, 160]
+                    } else {
+                        samples[(x / 40) as usize]
+                    };
+                    pixels.extend_from_slice(&[b, g, r, 255]);
+                }
+            }
+            unsafe {
+                context.UpdateSubresource(&texture, 0, None, pixels.as_ptr().cast(), size.0 * 4, 0);
+            }
+            converter.convert().unwrap();
+            if frame == 0 {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                unsafe {
+                    context.CopyResource(diagnostic.texture(), converter.texture());
+                    context
+                        .Map(
+                            diagnostic.texture(),
+                            0,
+                            D3D11_MAP_READ,
+                            0,
+                            Some(&mut mapped),
+                        )
+                        .unwrap();
+                    let pitch = mapped.RowPitch as usize;
+                    let data = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), pitch * 288);
+                    let values: Vec<_> = (0..8)
+                        .map(|slot| {
+                            let x = slot * 40 + 20;
+                            let uv = pitch * (192 + 30) + x;
+                            (data[60 * pitch + x], data[uv], data[uv + 1])
+                        })
+                        .collect();
+                    println!("Actual NV12 YUV patches {values:?}");
+                    context.Unmap(diagnostic.texture(), 0);
+                }
+            }
+            let bytes = encoder.picture(frame, frame % 6 == 0).unwrap();
+            assert!(!bytes.is_empty());
+            output.extend_from_slice(&bytes);
+        }
+        if let Some(path) = std::env::var_os("LAN_STREAM_COLOR_TEST_OUT") {
+            std::fs::write(path, output).unwrap();
+        }
+    }
+}
+use crate::color_gpu::Nv12Converter;

@@ -1,4 +1,5 @@
 mod audio;
+mod color_gpu;
 mod content;
 mod fast_video;
 mod gamepad;

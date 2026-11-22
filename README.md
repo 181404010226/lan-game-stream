@@ -14,7 +14,7 @@ Windows 端通过 Windows Graphics Capture 取画，依赖当前电脑 PATH 中�
 
 - 默认优先让视频走 UDP。交错发送视频分片，每个校验组可恢复一片丢失。手机丢弃过时帧，遇到无法恢复的帧就等下一个关键帧。UDP 不通时自动切回 TCP。配对、手柄按钮、音频和画幅信息走可靠连接，支持时 Xbox 摇杆用带序号的 UDP 最新状态，超时释放方向。
 - 主机复用 D3D11 采集纹理和像素缓冲，H.264 硬编码关闭帧重排和前瞻。新版会压缩 48 kHz 立体声音频，Android 用硬件解码并按时间戳安排显示。
-- `--quality latency` 优先在 NVIDIA 适配器上采集 D3D11 纹理，直接提交 NVENC。游戏画面在 GPU 上裁出窗口内容。黑边检测只取样少量行列。显卡、驱动或窗口尺寸不支持直送时，由 FFmpeg 路径接力。Android 使用 SurfaceView 即时提交最新帧。游戏显示器达到 120 Hz 时，该档位以 120 fps 为目标，手机会请求匹配的刷新率。UDP 无法稳定启用时切回低码率 60 fps。
+- `--quality latency` 优先在 NVIDIA 适配器上采集 D3D11 纹理。GPU 裁出游戏窗口，将 BGRA 转为 BT.709 有限范围 NV12，再直接提交 NVENC。黑边检测只取样少量行列。显卡或驱动不支持这条路径时，由 FFmpeg 接力。Android 使用 SurfaceView 即时提交最新帧。游戏显示器达到 120 Hz 时，该档位以 120 fps 为目标，手机会请求匹配的刷新率。UDP 无法稳定启用时切回低码率 60 fps。
 - `--quality auto` 会在 UDP 启用时选择 `balanced`，在 TCP 下选择 `smooth`。`smooth`、`balanced` 和 `sharp` 也可以手动选。画质档位只调整编码尺寸和码率，显示仍按游戏比例适配。
 
 ## 触控和画幅
