@@ -33,6 +33,12 @@ use stream_wire::{
 use video::{Capture, Encoder, Quality};
 use window::{Target, WindowResize};
 
+fn teardown(detail: &str) {
+    if std::env::var_os("LAN_STREAM_TEARDOWN_TRACE").is_some() {
+        eprintln!("stream shutdown: {detail}");
+    }
+}
+
 struct Options {
     config: PathBuf,
     bind: Option<Ipv4Addr>,
@@ -157,13 +163,16 @@ fn run() -> Result<()> {
     }
     println!("编码     {}", encoder.name());
     println!("连接后请让游戏窗口保持在前台。Ctrl+C 结束主机。\n");
+    let mut gamepad = None;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, peer)) => {
                 if !matches!(peer.ip(), IpAddr::V4(ip) if interface.contains(ip)) {
                     continue;
                 }
-                if let Err(error) = session(stream, &games, &encoder, opts.quality, &stop) {
+                if let Err(error) =
+                    session(stream, &games, &encoder, opts.quality, &mut gamepad, &stop)
+                {
                     eprintln!("会话结束：{error:#}");
                 }
             }
@@ -215,6 +224,7 @@ fn session(
     games: &HashMap<String, Game>,
     encoder: &Encoder,
     quality: Quality,
+    gamepad: &mut Option<Arc<Mutex<Gamepad>>>,
     host_stop: &AtomicBool,
 ) -> Result<()> {
     socket.set_nonblocking(false)?;
@@ -260,13 +270,16 @@ fn session(
         return Ok(());
     };
     let pad = if game.xbox && hello.content_updates {
-        match Gamepad::connect() {
-            Ok(pad) => Some(pad),
-            Err(error) => {
-                send(&mut socket, ERROR, error.to_string().as_bytes())?;
-                return Err(error);
+        if gamepad.is_none() {
+            match Gamepad::connect() {
+                Ok(pad) => *gamepad = Some(Arc::new(Mutex::new(pad))),
+                Err(error) => {
+                    send(&mut socket, ERROR, error.to_string().as_bytes())?;
+                    return Err(error);
+                }
             }
         }
+        gamepad.clone()
     } else {
         None
     };
@@ -400,7 +413,7 @@ struct StreamFeatures {
     compact_audio: bool,
     lane: Option<fast_video::FastVideo>,
     axes: Option<fast_video::FastInput>,
-    pad: Option<Gamepad>,
+    pad: Option<Arc<Mutex<Gamepad>>>,
 }
 
 fn stream(
@@ -445,9 +458,12 @@ fn stream(
     thread::scope(|group| {
         let stop_ref = &stop;
         let acknowledgement = tx.clone();
-        let pad = pad.map(|pad| Arc::new(Mutex::new(pad)));
-        if let (Some(axes), Some(input)) = (axes, pad.clone()) {
-            group.spawn(move || axes.receive(target, &input, stop_ref));
+        if let (Some(axes), Some(input)) = (&axes, pad.clone()) {
+            group.spawn(move || {
+                axes.receive(target, &input, stop_ref);
+                drop(input);
+                teardown("UDP input stopped");
+            });
         }
         group.spawn(move || read_controls(socket, target, pad, stop_ref, acknowledgement));
         let status = tx.clone();
@@ -465,6 +481,7 @@ fn stream(
             if let Err(error) = audio::capture(target.pid, &stop, audio_sender, compact_audio) {
                 eprintln!("游戏进程音频不可用：{error:#}");
             }
+            teardown("audio stopped");
         });
         let count = &encoded_frames;
         let capture_source = &capture;
@@ -497,6 +514,7 @@ fn stream(
                     .unwrap_or_else(|| "H.264 编码已结束".into());
                 let _ = tx.send((ERROR, text.into_bytes()));
             }
+            teardown("video sender stopped");
         });
         let mut last_video = Instant::now();
         let mut previous_count = 0;
@@ -553,6 +571,9 @@ fn stream(
             }
         };
         stop.store(true, Ordering::Relaxed);
+        if let Some(axes) = &axes {
+            axes.stop();
+        }
         let _ = socket.shutdown(Shutdown::Both);
         drop(rx);
         if let VideoCapture::Gpu(gpu) = &capture {
@@ -612,6 +633,11 @@ fn read_controls(
         }
     }
     stop.store(true, Ordering::Relaxed);
+    if let Some(pad) = &pad {
+        let _ = pad.lock().unwrap().update(PadState::default());
+    }
+    drop(pad);
+    teardown("TCP input stopped");
 }
 
 fn main() {

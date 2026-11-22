@@ -105,7 +105,9 @@ unsafe extern "C" fn collect_output(context: *mut c_void, data: *const c_void, l
 
 impl Drop for TextureEncoder {
     fn drop(&mut self) {
+        crate::teardown("NVENC resources closing");
         unsafe { lan_nvenc_destroy(self.0) };
+        crate::teardown("NVENC resources closed");
     }
 }
 
@@ -193,9 +195,11 @@ impl GpuVideo {
 impl Drop for GpuVideo {
     fn drop(&mut self) {
         self.stop();
+        crate::teardown("waiting for GPU worker");
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        crate::teardown("GPU worker joined");
     }
 }
 
@@ -266,8 +270,11 @@ impl WindowFrames {
 impl Drop for WindowFrames {
     fn drop(&mut self) {
         let _ = self.pool.RemoveFrameArrived(self.token);
+        crate::teardown("closing WGC session");
         let _ = self.session.Close();
+        crate::teardown("closing WGC frame pool");
         let _ = self.pool.Close();
+        crate::teardown("WGC closed");
     }
 }
 
@@ -462,6 +469,7 @@ fn capture(
             stats_at = Instant::now();
         }
     }
+    crate::teardown("capture loop stopped");
     Ok(())
 }
 

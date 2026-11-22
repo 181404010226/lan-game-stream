@@ -319,6 +319,7 @@ impl Drop for WindowResize {
             return;
         }
         let old = self.original;
+        crate::teardown("restoring game window");
         unsafe {
             SetWindowPos(
                 self.target.hwnd(),
@@ -330,5 +331,6 @@ impl Drop for WindowResize {
                 SWP_NOACTIVATE | SWP_NOZORDER,
             )
         };
+        crate::teardown("game window restored");
     }
 }

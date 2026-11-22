@@ -4,7 +4,6 @@
 
 // The Rust capture thread owns the device, its registered texture and this session.
 struct LanNvenc {
-    HMODULE library = nullptr;
     NV_ENCODE_API_FUNCTION_LIST api{};
     void* encoder = nullptr;
     NV_ENC_REGISTERED_PTR resource = nullptr;
@@ -17,9 +16,19 @@ struct LanNvenc {
         if (bitstream) api.nvEncDestroyBitstreamBuffer(encoder, bitstream);
         if (resource) api.nvEncUnregisterResource(encoder, resource);
         if (encoder) api.nvEncDestroyEncoder(encoder);
-        if (library) FreeLibrary(library);
     }
 };
+
+static HMODULE driver_library() {
+    // NVIDIA can run deferred D3D11 cleanup after the last encoder is destroyed.
+    static HMODULE library = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return library;
+}
+
+static void keep_hybrid_graphics_shim_loaded() {
+    HMODULE shim = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvdlistx.dll", &shim);
+}
 
 static int failure(LanNvenc* session, int stage, NVENCSTATUS status) {
     delete session;
@@ -31,12 +40,13 @@ extern "C" int lan_nvenc_create(void* device, void* texture, unsigned width, uns
     *result = nullptr;
     auto* session = new(std::nothrow) LanNvenc;
     if (!session) return 1000 + NV_ENC_ERR_OUT_OF_MEMORY;
-    session->library = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!session->library) return failure(session, 1, NV_ENC_ERR_UNSUPPORTED_DEVICE);
+    const auto library = driver_library();
+    if (!library) return failure(session, 1, NV_ENC_ERR_UNSUPPORTED_DEVICE);
+    keep_hybrid_graphics_shim_loaded();
     using CreateApi = NVENCSTATUS (NVENCAPI*)(NV_ENCODE_API_FUNCTION_LIST*);
     using GetVersion = NVENCSTATUS (NVENCAPI*)(uint32_t*);
-    const auto create_api = reinterpret_cast<CreateApi>(GetProcAddress(session->library, "NvEncodeAPICreateInstance"));
-    const auto get_version = reinterpret_cast<GetVersion>(GetProcAddress(session->library, "NvEncodeAPIGetMaxSupportedVersion"));
+    const auto create_api = reinterpret_cast<CreateApi>(GetProcAddress(library, "NvEncodeAPICreateInstance"));
+    const auto get_version = reinterpret_cast<GetVersion>(GetProcAddress(library, "NvEncodeAPIGetMaxSupportedVersion"));
     uint32_t supported = 0;
     if (!create_api || !get_version || get_version(&supported) != NV_ENC_SUCCESS
         || supported < ((NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION)) {
@@ -100,6 +110,7 @@ extern "C" int lan_nvenc_create(void* device, void* texture, unsigned width, uns
     init.encodeConfig = &config;
     status = api.nvEncInitializeEncoder(session->encoder, &init);
     if (status != NV_ENC_SUCCESS) return failure(session, 6, status);
+    keep_hybrid_graphics_shim_loaded();
 
     NV_ENC_REGISTER_RESOURCE register_texture{};
     register_texture.version = NV_ENC_REGISTER_RESOURCE_VER;

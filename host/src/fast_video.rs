@@ -1,8 +1,8 @@
 use crate::gamepad::Gamepad;
 use crate::window::Target;
-use socket2::Socket;
+use socket2::{SockRef, Socket};
 use std::io::{self, ErrorKind};
-use std::net::{TcpStream, UdpSocket};
+use std::net::{Shutdown, TcpStream, UdpSocket};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -129,6 +129,10 @@ pub struct FastInput {
 }
 
 impl FastInput {
+    pub fn stop(&self) {
+        let _ = SockRef::from(&self.socket).shutdown(Shutdown::Both);
+    }
+
     pub fn receive(&self, target: &Target, pad: &Mutex<Gamepad>, stop: &AtomicBool) {
         let mut buffer = [0; 64];
         let mut last = None;
@@ -136,6 +140,9 @@ impl FastInput {
         while !stop.load(Ordering::Relaxed) {
             match self.socket.recv(&mut buffer) {
                 Ok(count) => {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if let Some(axes) = udp::Axes::parse(&buffer[..count], self.cookie)
                         && last.is_none_or(|previous| axes.follows(previous))
                     {
