@@ -1,0 +1,10 @@
+/target/
+/build/
+/local.properties
+lan-stream-games.json
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.pfx

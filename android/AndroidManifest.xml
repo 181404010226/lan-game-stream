@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.lanstream.mobile" android:versionCode="3" android:versionName="0.2.1">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:allowBackup="false" android:usesCleartextTraffic="true"
+        android:extractNativeLibs="false" android:hardwareAccelerated="true"
+        android:icon="@drawable/ic_lan_stream" android:label="局域网串玩"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity android:name="dev.lanstream.mobile.MainActivity" android:exported="true"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize"
+            android:screenOrientation="sensorLandscape" android:windowSoftInputMode="stateAlwaysHidden|adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
