@@ -5,11 +5,14 @@ use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use stream_wire::ContentInsets;
+use windows::Win32::Graphics::Direct3D11::{D3D11_BOX, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use windows_capture::d3d11::StagingTexture;
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
 use windows_capture::settings::*;
@@ -23,6 +26,16 @@ pub struct Pixels {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    pool: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Drop for Pixels {
+    fn drop(&mut self) {
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < 3 && self.bgra.capacity() < 48 * 1024 * 1024 {
+            pool.push(std::mem::take(&mut self.bgra));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -70,23 +83,29 @@ impl FrameSlot {
 struct WindowGrab {
     target: Target,
     slot: Arc<FrameSlot>,
-    since_last_frame: Instant,
+    next_capture: Instant,
+    capture_interval: Duration,
     bars: Option<BlackBars>,
     last_sample: Instant,
+    staging: Option<StagingTexture>,
+    pool: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl GraphicsCaptureApiHandler for WindowGrab {
-    type Flags = (Target, Arc<FrameSlot>, bool);
+    type Flags = (Target, Arc<FrameSlot>, bool, u32);
     type Error = CaptureError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let (target, slot, inspect) = ctx.flags;
+        let (target, slot, inspect, fps) = ctx.flags;
         Ok(Self {
             target,
             slot,
-            since_last_frame: Instant::now() - Duration::from_secs(1),
+            next_capture: Instant::now(),
+            capture_interval: Duration::from_nanos(1_000_000_000 / u64::from(fps)),
             bars: inspect.then(BlackBars::default),
             last_sample: Instant::now() - Duration::from_secs(1),
+            staging: None,
+            pool: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -95,10 +114,14 @@ impl GraphicsCaptureApiHandler for WindowGrab {
         frame: &mut Frame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        if self.since_last_frame.elapsed() < Duration::from_millis(14) {
+        let now = Instant::now();
+        if now + self.capture_interval / 5 < self.next_capture {
             return Ok(());
         }
-        self.since_last_frame = Instant::now();
+        if now.saturating_duration_since(self.next_capture) > self.capture_interval {
+            self.next_capture = now;
+        }
+        self.next_capture += self.capture_interval;
         let (left, top, right, bottom) =
             capture_crop(self.target.hwnd(), frame.width(), frame.height());
         if right < left + 64 || bottom < top + 64 {
@@ -106,17 +129,23 @@ impl GraphicsCaptureApiHandler for WindowGrab {
         }
         let width = right - left;
         let height = bottom - top;
-        let mut mapped = frame.buffer_crop(left, top, right, bottom)?;
-        let stride = mapped.row_pitch() as usize;
-        let row_bytes = width as usize * 4;
-        let mut bgra = Vec::with_capacity(row_bytes * height as usize);
-        for row in mapped
-            .as_raw_buffer()
-            .chunks_exact(stride)
-            .take(height as usize)
-        {
-            bgra.extend_from_slice(&row[..row_bytes]);
+        let format = frame.desc().Format;
+        if self.staging.as_ref().is_none_or(|texture| {
+            let desc = texture.desc();
+            desc.Width != width || desc.Height != height || desc.Format != format
+        }) {
+            self.staging = Some(StagingTexture::new(frame.device(), width, height, format)?);
         }
+        let region = D3D11_BOX {
+            left,
+            top,
+            right,
+            bottom,
+            front: 0,
+            back: 1,
+        };
+        let mut bgra = self.pool.lock().unwrap().pop().unwrap_or_default();
+        read_pixels(frame, self.staging.as_ref().unwrap(), region, &mut bgra)?;
         if let Some(bars) = &mut self.bars
             && self.last_sample.elapsed() >= Duration::from_millis(125)
         {
@@ -132,6 +161,7 @@ impl GraphicsCaptureApiHandler for WindowGrab {
             width,
             height,
             bgra,
+            pool: self.pool.clone(),
         }));
         self.slot.ready.notify_one();
         Ok(())
@@ -144,13 +174,49 @@ impl GraphicsCaptureApiHandler for WindowGrab {
     }
 }
 
+fn read_pixels(
+    frame: &Frame,
+    staging: &StagingTexture,
+    region: D3D11_BOX,
+    output: &mut Vec<u8>,
+) -> windows::core::Result<()> {
+    let context = frame.device_context();
+    let texture = staging.texture();
+    let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+    let height = (region.bottom - region.top) as usize;
+    let row_bytes = (region.right - region.left) as usize * 4;
+    output.clear();
+    output.reserve(height * row_bytes);
+    // Both resources were created by the capture device. The mapped memory lasts until Unmap.
+    unsafe {
+        context.CopySubresourceRegion(
+            texture,
+            0,
+            0,
+            0,
+            0,
+            frame.as_raw_texture(),
+            0,
+            Some(&region),
+        );
+        context.Map(texture, 0, D3D11_MAP_READ, 0, Some(&mut map))?;
+        let stride = map.RowPitch as usize;
+        let rows = std::slice::from_raw_parts(map.pData.cast::<u8>(), stride * height);
+        for row in rows.chunks_exact(stride) {
+            output.extend_from_slice(&row[..row_bytes]);
+        }
+        context.Unmap(texture, 0);
+    }
+    Ok(())
+}
+
 pub struct Capture {
     pub slot: Arc<FrameSlot>,
     control: Option<CaptureControl<WindowGrab, CaptureError>>,
 }
 
 impl Capture {
-    pub fn start(target: &Target, content_updates: bool) -> Result<Self> {
+    pub fn start(target: &Target, content_updates: bool, fps: u32) -> Result<Self> {
         let slot = Arc::new(FrameSlot::default());
         let window = Window::from_raw_hwnd(target.hwnd());
         let settings = Settings::new(
@@ -161,7 +227,7 @@ impl Capture {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            (target.clone(), slot.clone(), content_updates),
+            (target.clone(), slot.clone(), content_updates, fps),
         );
         let control = WindowGrab::start_free_threaded(settings)
             .map_err(|err| anyhow!("窗口采集失败：{err}"))?;
@@ -217,6 +283,10 @@ impl Codec {
                 "1",
                 "-delay",
                 "0",
+                "-rc-lookahead",
+                "0",
+                "-spatial-aq",
+                "1",
             ],
             Self::Amf => &[
                 "-usage",
@@ -241,6 +311,60 @@ impl Codec {
 pub struct Encoder {
     ffmpeg: PathBuf,
     codec: Codec,
+}
+
+#[derive(Clone, Copy)]
+pub enum Quality {
+    Auto,
+    Smooth,
+    Balanced,
+    Sharp,
+    Latency,
+}
+
+impl FromStr for Quality {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "smooth" => Ok(Self::Smooth),
+            "balanced" => Ok(Self::Balanced),
+            "sharp" => Ok(Self::Sharp),
+            "latency" => Ok(Self::Latency),
+            _ => bail!("--quality 应为 auto、smooth、balanced、sharp 或 latency"),
+        }
+    }
+}
+
+impl Quality {
+    pub fn resolve(self, udp: bool) -> Self {
+        match self {
+            Self::Auto if udp => Self::Balanced,
+            Self::Auto => Self::Smooth,
+            Self::Latency if !udp => Self::Smooth,
+            selected => selected,
+        }
+    }
+
+    fn limits(self) -> (f64, f64) {
+        match self {
+            Self::Smooth | Self::Latency => (1600.0, 900.0),
+            _ => (1920.0, 1080.0),
+        }
+    }
+
+    fn rate(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Smooth => ("4500k", "180k"),
+            Self::Sharp => ("10M", "400k"),
+            Self::Latency => ("7M", "160k"),
+            _ => ("6500k", "260k"),
+        }
+    }
+
+    pub fn low_latency(self) -> bool {
+        matches!(self, Self::Latency)
+    }
 }
 
 impl Encoder {
@@ -289,15 +413,20 @@ impl Encoder {
         self.codec.name()
     }
 
-    pub fn start(&self, source: &Pixels, width: u32, height: u32) -> Result<Child> {
+    pub fn start(
+        &self,
+        source: &Pixels,
+        width: u32,
+        height: u32,
+        quality: Quality,
+        fps: u32,
+        rtp: Option<&str>,
+    ) -> Result<Child> {
         let size = format!("{}x{}", source.width, source.height);
         let filters = format!("scale={width}:{height}:flags=fast_bilinear,format=yuv420p");
-        let bitrate = if width * height > 1_400_000 {
-            "8M"
-        } else {
-            "5M"
-        };
-        Command::new(&self.ffmpeg)
+        let (bitrate, vbv) = quality.rate();
+        let mut command = Command::new(&self.ffmpeg);
+        command
             .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-hide_banner",
@@ -310,7 +439,7 @@ impl Encoder {
                 "-video_size",
                 &size,
                 "-framerate",
-                "60",
+                &fps.to_string(),
                 "-probesize",
                 "32",
                 "-analyzeduration",
@@ -334,30 +463,43 @@ impl Encoder {
                 "-maxrate",
                 bitrate,
                 "-bufsize",
-                "320k",
+                vbv,
                 "-bf",
                 "0",
                 "-g",
-                "30",
-                "-bsf:v",
-                "h264_metadata=aud=insert",
+                &(fps / 4).to_string(),
                 "-flush_packets",
                 "1",
-                "-f",
-                "h264",
-                "pipe:1",
-            ])
+            ]);
+        if let Some(endpoint) = rtp {
+            command
+                .args([
+                    "-f",
+                    "rtp",
+                    "-payload_type",
+                    "96",
+                    "-rtpflags",
+                    "skip_rtcp",
+                    endpoint,
+                ])
+                .stdout(Stdio::null());
+        } else {
+            command
+                .args(["-bsf:v", "h264_metadata=aud=insert", "-f", "h264", "pipe:1"])
+                .stdout(Stdio::piped());
+        }
+        command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .context("启动 H.264 编码失败")
     }
 }
 
-pub fn output_size(width: u32, height: u32) -> (u32, u32) {
-    let scale = (1920.0 / f64::from(width))
-        .min(1080.0 / f64::from(height))
+pub fn output_size(width: u32, height: u32, quality: Quality) -> (u32, u32) {
+    let (cap_w, cap_h) = quality.limits();
+    let scale = (cap_w / f64::from(width))
+        .min(cap_h / f64::from(height))
         .min(1.0);
     (
         ((f64::from(width) * scale).round() as u32) & !1,
@@ -370,8 +512,9 @@ pub fn feed(
     slot: &FrameSlot,
     first: &Pixels,
     stop: &AtomicBool,
+    fps: u32,
 ) -> Result<()> {
-    let interval = Duration::from_nanos(1_000_000_000 / u64::from(FPS));
+    let interval = Duration::from_nanos(1_000_000_000 / u64::from(fps));
     let mut next = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let frame = slot.latest().context("游戏窗口已关闭")?;
@@ -455,7 +598,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(pictures, vec![bytes[..16].to_vec(), bytes[16..].to_vec()]);
-        assert_eq!(output_size(2560, 1600), (1728, 1080));
-        assert_eq!(output_size(2800, 1260), (1920, 864));
+        assert_eq!(output_size(2560, 1600, Quality::Balanced), (1728, 1080));
+        assert_eq!(output_size(2800, 1260, Quality::Balanced), (1920, 864));
+        assert_eq!(output_size(1920, 864, Quality::Smooth), (1600, 720));
     }
 }

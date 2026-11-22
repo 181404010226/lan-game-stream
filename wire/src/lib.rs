@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::{self, Read, Write};
 
+pub mod audio;
+pub mod udp;
+
 const LEGACY_MAGIC: [u8; 4] = *b"LGS2";
 const MAGIC: [u8; 4] = *b"LGS3";
+const FAST_MAGIC: [u8; 4] = *b"LGS4";
 const DISCOVERY: [u8; 4] = *b"LGD2";
 pub const PORT: u16 = 24865;
 pub const MAX_MEDIA: usize = 2 * 1024 * 1024;
@@ -19,9 +23,15 @@ pub const ERROR: u8 = 4;
 pub const CHALLENGE: u8 = 5;
 pub const AUTH: u8 = 6;
 pub const CONTENT: u8 = 7;
+pub const UDP_OFFER: u8 = 8;
+pub const UDP_READY: u8 = 9;
+pub const AUDIO_COMPACT: u8 = 10;
+pub const KEEPALIVE: u8 = 11;
+pub const PONG: u8 = 12;
 pub const KEYS: u8 = 16;
 pub const POINTER: u8 = 17;
 pub const GAMEPAD: u8 = 18;
+pub const PING: u8 = 19;
 const STANDARD_PAD_BUTTONS: u16 = 0xf3ff;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,6 +43,10 @@ pub struct StreamInfo {
     pub fps: u32,
     pub encoder: String,
     pub phone_aspect: bool,
+    #[serde(default)]
+    pub udp_video: bool,
+    #[serde(default)]
+    pub low_latency: bool,
 }
 
 pub struct Hello {
@@ -40,12 +54,15 @@ pub struct Hello {
     pub nonce: Nonce,
     pub viewport: (u16, u16),
     pub content_updates: bool,
+    pub fast_video: bool,
 }
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(25 + self.game.len());
-        bytes.extend_from_slice(if self.content_updates {
+        bytes.extend_from_slice(if self.fast_video {
+            &FAST_MAGIC
+        } else if self.content_updates {
             &MAGIC
         } else {
             &LEGACY_MAGIC
@@ -65,7 +82,8 @@ impl Hello {
     pub fn read(input: &mut impl Read) -> io::Result<Self> {
         let mut bytes = [0; 25];
         input.read_exact(&mut bytes)?;
-        let content_updates = bytes[..4] == MAGIC;
+        let fast_video = bytes[..4] == FAST_MAGIC;
+        let content_updates = bytes[..4] == MAGIC || fast_video;
         if !content_updates && bytes[..4] != LEGACY_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "协议版本不匹配"));
         }
@@ -87,6 +105,7 @@ impl Hello {
                 u16::from_be_bytes([bytes[22], bytes[23]]),
             ),
             content_updates,
+            fast_video,
         })
     }
 }
@@ -226,6 +245,7 @@ mod tests {
             nonce: [9; 16],
             viewport: (2800, 1260),
             content_updates: true,
+            fast_video: true,
         };
         hello.write(&mut bytes).unwrap();
         let received = Hello::read(&mut bytes.as_slice()).unwrap();
@@ -233,8 +253,10 @@ mod tests {
         assert_eq!(received.nonce, hello.nonce);
         assert_eq!(received.viewport, hello.viewport);
         assert!(received.content_updates);
+        assert!(received.fast_video);
         let original = Hello {
             content_updates: false,
+            fast_video: false,
             ..hello
         };
         assert!(

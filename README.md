@@ -10,6 +10,13 @@
 
 Windows 端通过 Windows Graphics Capture 取画，依赖当前电脑 PATH 中的 FFmpeg 编码 H.264。可把完整的 `ffmpeg.exe` 路径设到 `LAN_STREAM_FFMPEG`。主机会探测 NVIDIA 和 AMD 硬件编码，必要时使用 `libx264`。
 
+## 串流质量和延迟
+
+- 默认优先让视频走 UDP，分片组的校验片可恢复一片丢失。手机丢弃过时帧，遇到无法恢复的帧就等下一个关键帧。UDP 不通时自动切回 TCP。配对、手柄指令、音频和画幅信息走可靠连接。
+- 主机复用 D3D11 采集纹理和像素缓冲，H.264 硬编码关闭帧重排和前瞻。新版会压缩 48 kHz 立体声音频，Android 用硬件解码并按时间戳安排显示。
+- `--quality latency` 可去掉编码器输出的下一帧等待，并通过 Android SurfaceView 即时提交最新帧。游戏所在显示器的当前刷新率达到 120 Hz 时，该档位以 120 fps 为目标，手机会请求匹配的刷新率。UDP 无法稳定启用时切回低码率 60 fps。
+- `--quality auto` 会在 UDP 启用时选择 `balanced`，在 TCP 下选择 `smooth`。`smooth`、`balanced` 和 `sharp` 也可以手动选。画质档位只调整编码尺寸和码率，显示仍按游戏比例适配。
+
 ## 触控和画幅
 
 - 手机右上角 `⋯` 进入「编辑触控布局」。拖动控件改变位置，点按控件修改键位、名称和大小。可以另加按键。每个游戏 APK 单独保存布局和画幅。
@@ -42,6 +49,7 @@ Copy-Item -LiteralPath '.\target\release\lan-stream-host.exe' -Destination '.\bu
 ```powershell
 .\lan-stream-host.exe --list
 .\lan-stream-host.exe --bind 192.168.1.20 --port 24865
+.\lan-stream-host.exe --quality latency
 ```
 
 ## 许可证

@@ -1,8 +1,10 @@
 mod audio;
 mod content;
+mod fast_video;
 mod gamepad;
 mod input;
 mod network;
+mod rtp;
 mod video;
 mod window;
 
@@ -16,16 +18,16 @@ use std::io::{BufReader, BufWriter, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 use stream_wire::{
-    AUTH, CHALLENGE, CONTENT, ContentInsets, ERROR, GAMEPAD, Hello, INFO, KEYS, MAX_CONTROL,
-    POINTER, PORT, PadState, Secret, StreamInfo, VIDEO, discovery_game, nonce, parse_secret,
-    receive, send, sign, valid_id, verifies,
+    AUTH, CHALLENGE, CONTENT, ContentInsets, ERROR, GAMEPAD, Hello, INFO, KEEPALIVE, KEYS,
+    MAX_CONTROL, PING, POINTER, PONG, PORT, PadState, Secret, StreamInfo, VIDEO, discovery_game,
+    nonce, parse_secret, receive, send, sign, valid_id, verifies,
 };
-use video::{Capture, Encoder};
+use video::{Capture, Encoder, Quality};
 use window::{Target, WindowResize};
 
 struct Options {
@@ -33,6 +35,7 @@ struct Options {
     bind: Option<Ipv4Addr>,
     port: u16,
     list: bool,
+    quality: Quality,
 }
 
 fn options() -> Result<Option<Options>> {
@@ -41,6 +44,7 @@ fn options() -> Result<Option<Options>> {
         bind: None,
         port: PORT,
         list: false,
+        quality: Quality::Auto,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -49,9 +53,10 @@ fn options() -> Result<Option<Options>> {
             "--config" => result.config = args.next().context("--config 缺少配置路径")?.into(),
             "--bind" => result.bind = Some(args.next().context("--bind 缺少 IPv4 地址")?.parse()?),
             "--port" => result.port = args.next().context("--port 缺少端口")?.parse()?,
+            "--quality" => result.quality = args.next().context("--quality 缺少设置")?.parse()?,
             "--help" | "-h" => {
                 println!(
-                    "局域网游戏串流主机\n\nlan-stream-host.exe [--config 游戏配置路径] [--bind 局域网 IPv4] [--port 24865]\nlan-stream-host.exe --list"
+                    "局域网游戏串流主机\n\nlan-stream-host.exe [--config 游戏配置路径] [--bind 局域网 IPv4] [--port 24865] [--quality auto|smooth|balanced|sharp|latency]\nlan-stream-host.exe --list"
                 );
                 return Ok(None);
             }
@@ -147,7 +152,7 @@ fn run() -> Result<()> {
     for game in games.values() {
         println!("已绑定   {}", game.title);
     }
-    println!("编码     {} / 目标 {} fps", encoder.name(), video::FPS);
+    println!("编码     {}", encoder.name());
     println!("连接后请让游戏窗口保持在前台。Ctrl+C 结束主机。\n");
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -155,7 +160,7 @@ fn run() -> Result<()> {
                 if !matches!(peer.ip(), IpAddr::V4(ip) if interface.contains(ip)) {
                     continue;
                 }
-                if let Err(error) = session(stream, &games, &encoder, &stop) {
+                if let Err(error) = session(stream, &games, &encoder, opts.quality, &stop) {
                     eprintln!("会话结束：{error:#}");
                 }
             }
@@ -206,6 +211,7 @@ fn session(
     mut socket: TcpStream,
     games: &HashMap<String, Game>,
     encoder: &Encoder,
+    quality: Quality,
     host_stop: &AtomicBool,
 ) -> Result<()> {
     socket.set_nonblocking(false)?;
@@ -237,6 +243,11 @@ fn session(
         send(&mut socket, ERROR, "游戏配对未通过".as_bytes())?;
         return Ok(());
     }
+    let lane = if hello.fast_video {
+        fast_video::FastVideo::negotiate(&mut socket)?
+    } else {
+        None
+    };
     let Some(target) = window::for_exe(&game.exe)? else {
         send(
             &mut socket,
@@ -256,11 +267,23 @@ fn session(
     } else {
         None
     };
-    let _resize = WindowResize::apply(&target, hello.viewport);
+    let quality = quality.resolve(lane.is_some());
+    let low_latency = quality.low_latency();
+    let refresh = window::refresh_rate(&target);
+    let fps = if low_latency && refresh >= 119 {
+        120
+    } else {
+        video::FPS
+    };
+    let _resize = WindowResize::apply(
+        &target,
+        hello.viewport,
+        if low_latency { 1600 } else { 1920 },
+    );
     if _resize.is_some() {
         thread::sleep(Duration::from_millis(300));
     }
-    let capture = match Capture::start(&target, hello.content_updates) {
+    let capture = match Capture::start(&target, hello.content_updates, fps) {
         Ok(capture) => capture,
         Err(error) => {
             send(&mut socket, ERROR, error.to_string().as_bytes())?;
@@ -274,8 +297,17 @@ fn session(
             return Err(error);
         }
     };
-    let (width, height) = video::output_size(first.width, first.height);
-    let mut child = match encoder.start(&first, width, height) {
+    let (width, height) = video::output_size(first.width, first.height, quality);
+    let local_rtp = if low_latency {
+        rtp::RtpVideo::bind().ok()
+    } else {
+        None
+    };
+    let endpoint = local_rtp
+        .as_ref()
+        .map(rtp::RtpVideo::endpoint)
+        .transpose()?;
+    let mut child = match encoder.start(&first, width, height, quality, fps, endpoint.as_deref()) {
         Ok(child) => child,
         Err(error) => {
             send(&mut socket, ERROR, error.to_string().as_bytes())?;
@@ -289,9 +321,11 @@ fn session(
         title: game.title.clone(),
         width,
         height,
-        fps: video::FPS,
+        fps,
         encoder: encoder.name().into(),
         phone_aspect: desired.is_finite() && (active / desired - 1.0).abs() < 0.02,
+        udp_video: lane.is_some(),
+        low_latency,
     };
     let result = stream(
         &socket,
@@ -300,13 +334,26 @@ fn session(
         &first,
         &mut child,
         &info,
-        hello.content_updates,
-        pad,
+        StreamFeatures {
+            content_updates: hello.content_updates,
+            compact_audio: hello.fast_video,
+            lane,
+            local_rtp,
+            pad,
+        },
         host_stop,
     );
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+struct StreamFeatures {
+    content_updates: bool,
+    compact_audio: bool,
+    lane: Option<fast_video::FastVideo>,
+    local_rtp: Option<rtp::RtpVideo>,
+    pad: Option<Gamepad>,
 }
 
 fn stream(
@@ -316,33 +363,43 @@ fn stream(
     first: &video::Pixels,
     child: &mut std::process::Child,
     info: &StreamInfo,
-    content_updates: bool,
-    pad: Option<Gamepad>,
+    features: StreamFeatures,
     host_stop: &AtomicBool,
 ) -> Result<()> {
     let mut output = BufWriter::with_capacity(128 * 1024, socket);
     send(&mut output, INFO, &serde_json::to_vec(info)?)?;
     println!(
-        "已连接 {} · {}×{} · {}",
+        "已连接 {} · {}×{} {} fps · {} · {}",
         socket.peer_addr()?,
         info.width,
         info.height,
+        info.fps,
         if info.phone_aspect {
             "窗口匹配手机画幅"
         } else {
             "游戏画幅"
-        }
+        },
+        if info.udp_video { "UDP/FEC" } else { "TCP" }
     );
     let stdin = child.stdin.take().context("编码器没有输入流")?;
-    let stdout = child.stdout.take().context("编码器没有输出流")?;
+    let stdout = child.stdout.take();
     let stop = AtomicBool::new(false);
+    let encoded_frames = AtomicU32::new(0);
+    let StreamFeatures {
+        content_updates,
+        compact_audio,
+        lane,
+        local_rtp,
+        pad,
+    } = features;
     let (tx, rx) = sync_channel::<(u8, Vec<u8>)>(12);
     thread::scope(|group| {
         let stop_ref = &stop;
-        group.spawn(move || read_controls(socket, target, pad, stop_ref));
+        let acknowledgement = tx.clone();
+        group.spawn(move || read_controls(socket, target, pad, stop_ref, acknowledgement));
         let status = tx.clone();
         group.spawn(move || {
-            if let Err(error) = video::feed(stdin, &capture.slot, first, stop_ref)
+            if let Err(error) = video::feed(stdin, &capture.slot, first, stop_ref, info.fps)
                 && !stop_ref.load(Ordering::Relaxed)
             {
                 let _ = status.try_send((ERROR, error.to_string().into_bytes()));
@@ -350,19 +407,30 @@ fn stream(
         });
         let audio_sender = tx.clone();
         group.spawn(|| {
-            if let Err(error) = audio::capture(target.pid, &stop, audio_sender) {
+            if let Err(error) = audio::capture(target.pid, &stop, audio_sender, compact_audio) {
                 eprintln!("游戏进程音频不可用：{error:#}");
             }
         });
+        let count = &encoded_frames;
         group.spawn(move || {
-            let result = video::access_units(stdout, |encoded| {
+            let emit = |encoded: Vec<u8>| {
                 if stop_ref.load(Ordering::Relaxed) {
                     bail!("会话已结束");
                 }
-                tx.send((VIDEO, encoded))
-                    .map_err(|_| anyhow!("会话已结束"))?;
+                let sequence = count.fetch_add(1, Ordering::Relaxed);
+                if let Some(lane) = &lane {
+                    lane.picture(sequence, &encoded)?;
+                } else {
+                    tx.send((VIDEO, encoded))
+                        .map_err(|_| anyhow!("会话已结束"))?;
+                }
                 Ok(())
-            });
+            };
+            let result = match (local_rtp, stdout) {
+                (Some(rtp), _) => rtp.access_units(stop_ref, emit),
+                (None, Some(stdout)) => video::access_units(stdout, emit),
+                _ => Err(anyhow!("编码器没有输出流")),
+            };
             if !stop_ref.load(Ordering::Relaxed) {
                 let text = result
                     .err()
@@ -372,7 +440,9 @@ fn stream(
             }
         });
         let mut last_video = Instant::now();
+        let mut previous_count = 0;
         let mut last_update = Instant::now();
+        let mut keepalive = Instant::now();
         let mut content = ContentInsets::default();
         let result = loop {
             if stop.load(Ordering::Relaxed) || host_stop.load(Ordering::Relaxed) {
@@ -381,8 +451,19 @@ fn stream(
             if !target.exists() || capture.ended() {
                 break send(&mut output, ERROR, "游戏窗口已关闭".as_bytes());
             }
+            let count = encoded_frames.load(Ordering::Relaxed);
+            if count != previous_count {
+                previous_count = count;
+                last_video = Instant::now();
+            }
             if last_video.elapsed() > Duration::from_secs(7) {
                 break send(&mut output, ERROR, "接收游戏画面超时".as_bytes());
+            }
+            if compact_audio && keepalive.elapsed() >= Duration::from_secs(1) {
+                keepalive = Instant::now();
+                if let Err(error) = send(&mut output, KEEPALIVE, &[]) {
+                    break Err(error);
+                }
             }
             if content_updates && last_update.elapsed() >= Duration::from_millis(100) {
                 last_update = Instant::now();
@@ -419,7 +500,13 @@ fn stream(
     })
 }
 
-fn read_controls(socket: &TcpStream, target: &Target, mut pad: Option<Gamepad>, stop: &AtomicBool) {
+fn read_controls(
+    socket: &TcpStream,
+    target: &Target,
+    mut pad: Option<Gamepad>,
+    stop: &AtomicBool,
+    acknowledgement: SyncSender<(u8, Vec<u8>)>,
+) {
     let mut controls = GameInput::new(target);
     let mut input = BufReader::new(socket);
     let mut buffer = Vec::new();
@@ -427,6 +514,9 @@ fn read_controls(socket: &TcpStream, target: &Target, mut pad: Option<Gamepad>, 
         match receive(&mut input, &mut buffer, MAX_CONTROL) {
             Ok(KEYS) => controls.apply_keys(&buffer[1..]),
             Ok(POINTER) => controls.pointer(&buffer[1..]),
+            Ok(PING) if buffer.len() == 9 => {
+                let _ = acknowledgement.try_send((PONG, buffer[1..].to_vec()));
+            }
             Ok(GAMEPAD) => {
                 if let (Some(controller), Some(state)) = (&mut pad, PadState::decode(&buffer[1..]))
                 {

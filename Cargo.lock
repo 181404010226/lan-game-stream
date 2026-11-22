@@ -239,23 +239,26 @@ dependencies = [
 
 [[package]]
 name = "lan-stream-android"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "jni",
+ "socket2",
  "stream-wire",
 ]
 
 [[package]]
 name = "lan-stream-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ctrlc",
  "serde",
  "serde_json",
+ "socket2",
  "stream-wire",
  "vigem-client",
  "wasapi",
+ "windows",
  "windows-capture",
  "windows-sys 0.61.2",
 ]
@@ -484,8 +487,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "stream-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom",
  "hmac",

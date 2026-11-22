@@ -6,7 +6,8 @@ use windows_capture::window::Window;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    ClientToScreen, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
 };
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -44,6 +45,21 @@ impl Target {
 
 pub fn enable_physical_pixels() {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+pub fn refresh_rate(target: &Target) -> u32 {
+    let monitor = unsafe { MonitorFromWindow(target.hwnd(), MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    let mut mode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let valid = unsafe {
+        GetMonitorInfoW(monitor, &mut info.monitorInfo) != 0
+            && EnumDisplaySettingsW(info.szDevice.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) != 0
+    };
+    if valid { mode.dmDisplayFrequency } else { 60 }
 }
 
 pub fn list() -> Result<Vec<Target>> {
@@ -200,7 +216,7 @@ pub struct WindowResize {
 }
 
 impl WindowResize {
-    pub fn apply(target: &Target, viewport: (u16, u16)) -> Option<Self> {
+    pub fn apply(target: &Target, viewport: (u16, u16), capture_width: i32) -> Option<Self> {
         let aspect = f64::from(viewport.0) / f64::from(viewport.1);
         if !(1.3..=3.0).contains(&aspect) {
             return None;
@@ -225,11 +241,12 @@ impl WindowResize {
         let work = info.rcWork;
         let (client_width, client_height, _) = client_geometry(hwnd)?;
         if client_height > 0
+            && client_width <= capture_width
             && (f64::from(client_width) / f64::from(client_height) / aspect - 1.0).abs() < 0.015
         {
             return None;
         }
-        let max_width = (work.right - work.left - 80).clamp(240, 1920);
+        let max_width = (work.right - work.left - 80).clamp(240, capture_width);
         let max_height = (work.bottom - work.top - 100).clamp(180, 1080);
         let height = client_height
             .max(i32::from(viewport.1))

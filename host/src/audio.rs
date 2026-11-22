@@ -7,6 +7,7 @@ pub fn capture(
     pid: u32,
     stop: &AtomicBool,
     packets: SyncSender<(u8, Vec<u8>)>,
+    compact: bool,
 ) -> anyhow::Result<()> {
     initialize_mta().ok()?;
     let format = WaveFormat::new(32, 32, SampleType::Float, 48000, 2, None);
@@ -19,6 +20,7 @@ pub fn capture(
     let event = client.set_get_eventhandle()?;
     let capture = client.get_audiocaptureclient()?;
     let mut samples = VecDeque::new();
+    let mut encoder = stream_wire::audio::CompactEncoder::default();
     let mut notified = false;
     client.start_stream()?;
     while !stop.load(Ordering::Relaxed) {
@@ -34,7 +36,15 @@ pub fn capture(
                 let sample = (float.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
                 pcm.extend_from_slice(&sample.to_le_bytes());
             }
-            match packets.try_send((stream_wire::AUDIO, pcm)) {
+            let packet = if compact {
+                (
+                    stream_wire::AUDIO_COMPACT,
+                    encoder.encode(&pcm).expect("complete stereo PCM"),
+                )
+            } else {
+                (stream_wire::AUDIO, pcm)
+            };
+            match packets.try_send(packet) {
                 Ok(()) => {
                     if !notified {
                         println!("已采集游戏进程音频");

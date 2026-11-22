@@ -1,22 +1,25 @@
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JString};
-use jni::sys::{jbyteArray, jint, jlong, jstring};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
+use socket2::Socket;
 use std::collections::HashMap;
 use std::io::{self, BufReader};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use stream_wire::{
-    AUTH, CHALLENGE, ERROR, GAMEPAD, Hello, INFO, KEYS, MAX_CONTROL, MAX_MEDIA, POINTER, PadState,
-    Secret, discovery_request, nonce, parse_secret, receive, send, sign, valid_id, verifies,
+    AUDIO, AUDIO_COMPACT, AUTH, CHALLENGE, ERROR, GAMEPAD, Hello, INFO, KEYS, MAX_CONTROL,
+    MAX_MEDIA, POINTER, PadState, Secret, UDP_OFFER, UDP_READY, discovery_request, nonce,
+    parse_secret, receive, send, sign, valid_id, verifies,
 };
 
 struct Reader {
     socket: BufReader<TcpStream>,
     buffer: Vec<u8>,
+    pcm: Vec<u8>,
 }
 
 struct Client {
@@ -24,6 +27,8 @@ struct Client {
     control: TcpStream,
     commands: SyncSender<(u8, Vec<u8>)>,
     info: String,
+    datagrams: Option<Mutex<Datagrams>>,
+    active: AtomicBool,
 }
 
 impl Client {
@@ -33,6 +38,7 @@ impl Client {
         game: String,
         secret: Secret,
         viewport: (u16, u16),
+        fast_video: bool,
     ) -> io::Result<Self> {
         let request = discovery_request(&game, nonce()?);
         let ip = discover(address_hint, port, &request, &secret)
@@ -49,11 +55,13 @@ impl Client {
             nonce: nonce()?,
             viewport,
             content_updates: true,
+            fast_video,
         };
         hello.write(&mut socket)?;
         let mut reader = Reader {
             socket: BufReader::with_capacity(64 * 1024, socket),
             buffer: Vec::new(),
+            pcm: Vec::new(),
         };
         let kind = receive(&mut reader.socket, &mut reader.buffer, 8192)?;
         if kind == ERROR {
@@ -77,7 +85,19 @@ impl Client {
             .socket
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(9)))?;
-        let kind = receive(&mut reader.socket, &mut reader.buffer, 8192)?;
+        let mut kind = receive(&mut reader.socket, &mut reader.buffer, 8192)?;
+        let datagrams = if kind == UDP_OFFER && fast_video {
+            let lane = Datagrams::accept(ip, &reader.buffer[1..]);
+            send(
+                &mut reader.socket.get_ref(),
+                UDP_READY,
+                &[u8::from(lane.is_some())],
+            )?;
+            kind = receive(&mut reader.socket, &mut reader.buffer, 8192)?;
+            lane
+        } else {
+            None
+        };
         let info = error_text(&reader.buffer);
         if kind == ERROR {
             return Err(io::Error::other(info));
@@ -105,6 +125,8 @@ impl Client {
             control,
             commands,
             info,
+            datagrams: datagrams.map(Mutex::new),
+            active: AtomicBool::new(true),
         })
     }
 
@@ -114,6 +136,71 @@ impl Client {
         {
             let _ = self.control.shutdown(Shutdown::Both);
         }
+    }
+}
+
+struct Datagrams {
+    socket: UdpSocket,
+    video: stream_wire::udp::Assembler,
+    last_picture: Option<Instant>,
+}
+
+impl Datagrams {
+    fn accept(ip: Ipv4Addr, offer: &[u8]) -> Option<Self> {
+        let [port_hi, port_low, rest @ ..] = offer else {
+            return None;
+        };
+        let cookie: [u8; 8] = rest.try_into().ok()?;
+        let port = u16::from_be_bytes([*port_hi, *port_low]);
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        let tuned = Socket::from(socket);
+        let _ = tuned.set_recv_buffer_size(2 * 1024 * 1024);
+        let socket: UdpSocket = tuned.into();
+        socket.connect((ip, port)).ok()?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(215)))
+            .ok()?;
+        socket.send(&cookie).ok()?;
+        let mut reply = [0; 16];
+        let length = socket.recv(&mut reply).ok()?;
+        if reply[..length] != cookie {
+            return None;
+        }
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .ok()?;
+        Some(Self {
+            socket,
+            video: stream_wire::udp::Assembler::new(cookie, Duration::from_millis(42)),
+            last_picture: None,
+        })
+    }
+
+    fn read(&mut self, active: &AtomicBool) -> io::Result<Option<stream_wire::udp::Picture>> {
+        let mut payload = [0_u8; stream_wire::udp::MAX_DATAGRAM + 1];
+        let started = *self.last_picture.get_or_insert_with(Instant::now);
+        while active.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if let Some(picture) = self.video.ready(now) {
+                self.last_picture = Some(now);
+                return Ok(Some(picture));
+            }
+            if now.duration_since(started) > Duration::from_millis(1250) {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "UDP 视频超时"));
+            }
+            match self.socket.recv(&mut payload) {
+                Ok(size) => self.video.packet(&payload[..size], Instant::now()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -172,6 +259,7 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_open(
     key: JString,
     width: jint,
     height: jint,
+    fast_video: jboolean,
 ) -> jlong {
     let get = |env: &mut JNIEnv<'_>, string: &JString<'_>| -> io::Result<String> {
         env.get_string(string)
@@ -194,7 +282,19 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_open(
             .ok()
             .filter(|port| *port > 0)
             .ok_or_else(|| io::Error::other("端口无效"))?;
-        Client::connect(hint, port, game, secret, size)
+        let fast = fast_video != 0;
+        match Client::connect(hint, port, game.clone(), secret, size, fast) {
+            Err(error)
+                if fast
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                Client::connect(hint, port, game, secret, size, false)
+            }
+            result => result,
+        }
     })();
     match connect {
         Ok(connection) => {
@@ -221,6 +321,18 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_info(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_ping(
+    _env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+    timestamp: jlong,
+) {
+    if let Some(client) = client(id) {
+        client.queue(stream_wire::PING, timestamp.to_be_bytes().to_vec());
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_read(
     mut env: JNIEnv,
     _class: JClass,
@@ -230,11 +342,53 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_read(
         return null_mut();
     };
     let mut reader = client.reader.lock().unwrap();
-    let Reader { socket, buffer } = &mut *reader;
+    let Reader {
+        socket,
+        buffer,
+        pcm,
+    } = &mut *reader;
     match receive(socket, buffer, MAX_MEDIA) {
+        Ok(AUDIO_COMPACT) => {
+            pcm.clear();
+            pcm.push(AUDIO);
+            if stream_wire::audio::decode(&buffer[1..], pcm).is_none() {
+                throw(&mut env, "音频封包无效");
+                return null_mut();
+            }
+            env.byte_array_from_slice(pcm)
+                .map_or(null_mut(), JByteArray::into_raw)
+        }
         Ok(_) => env
             .byte_array_from_slice(buffer)
             .map_or(null_mut(), JByteArray::into_raw),
+        Err(error) => {
+            throw(&mut env, error);
+            null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_readPicture(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+) -> jbyteArray {
+    let Some(client) = client(id) else {
+        return null_mut();
+    };
+    let Some(lane) = &client.datagrams else {
+        return null_mut();
+    };
+    match lane.lock().unwrap().read(&client.active) {
+        Ok(Some(picture)) => {
+            let mut packet = Vec::with_capacity(4 + picture.data.len());
+            packet.extend_from_slice(&picture.sequence.to_be_bytes());
+            packet.extend_from_slice(&picture.data);
+            env.byte_array_from_slice(&packet)
+                .map_or(null_mut(), JByteArray::into_raw)
+        }
+        Ok(None) => null_mut(),
         Err(error) => {
             throw(&mut env, error);
             null_mut()
@@ -295,6 +449,7 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_close(
 ) {
     let connection = clients().lock().unwrap().remove(&id);
     if let Some(connection) = connection {
+        connection.active.store(false, Ordering::Relaxed);
         let _ = connection.control.shutdown(Shutdown::Both);
     }
 }

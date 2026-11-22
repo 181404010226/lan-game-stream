@@ -18,8 +18,11 @@ import android.os.Looper;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.util.Log;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.View;
 import android.view.WindowInsets;
@@ -48,6 +51,7 @@ public final class MainActivity extends Activity {
     private FrameLayout play;
     private LinearLayout editBar;
     private TextureView texture;
+    private SurfaceView directView;
     private TouchOverlay overlay;
     private Button menu;
     private TextView connectionStatus;
@@ -59,6 +63,11 @@ public final class MainActivity extends Activity {
     private int insetLeft, insetTop, insetRight, insetBottom;
     private boolean editing, muted, foreground, connecting;
     private boolean controlsVisible = true;
+    private boolean preferUdp = true;
+    private long lastUdpRetry;
+    private int displayModeBefore;
+    private float refreshBefore;
+    private boolean displayModeRequested;
     private float sourceInsetX, sourceInsetY;
     private String lastPlacement;
     private final Runnable autoRetry = this::connect;
@@ -87,6 +96,8 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        preferUdp = true;
+        lastUdpRetry = 0;
         immersive();
         if (session == 0) {
             showWaiting("正在查找电脑主机…");
@@ -158,7 +169,7 @@ public final class MainActivity extends Activity {
             long connection = 0;
             try {
                 connection = NativeBridge.open(GameBinding.HOST_HINT, GameBinding.PORT, GameBinding.ID, GameBinding.KEY,
-                    phoneAspect ? display.x : 0, phoneAspect ? display.y : 0);
+                    phoneAspect ? display.x : 0, phoneAspect ? display.y : 0, preferUdp);
                 Stream info = new Stream(NativeBridge.info(connection));
                 long acquired = connection;
                 ui.post(() -> {
@@ -190,30 +201,7 @@ public final class MainActivity extends Activity {
         insetLeft = insetTop = insetRight = insetBottom = 0;
         play = new FrameLayout(this);
         play.setBackgroundColor(0xff080b0a);
-        texture = new TextureView(this);
-        play.addView(texture, new FrameLayout.LayoutParams(-1, -1));
-        texture.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
-            @Override public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
-                if (generation != token || media != null) return;
-                surface.setDefaultBufferSize(info.width, info.height);
-                media = new MediaRunner(handle, new Surface(surface), info.width, info.height, info.fps, muted,
-                    reason -> ui.post(() -> { if (generation == token) reconnect(reason); }),
-                    (x, y) -> ui.post(() -> {
-                        if (generation != token) return;
-                        sourceInsetX = x;
-                        sourceInsetY = y;
-                        updateGeometry();
-                    }));
-                media.start();
-                updateGeometry();
-            }
-            @Override public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) { updateGeometry(); }
-            @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
-                if (generation == token) ui.post(() -> { if (generation == token) reconnect("画面已暂停，正在重新连接…"); });
-                return true;
-            }
-            @Override public void onSurfaceTextureUpdated(SurfaceTexture surface) {}
-        });
+        attachVideo(handle, info, token);
 
         overlay = new TouchOverlay(this, profile, new TouchOverlay.Callbacks() {
             @Override public void keys(int[] keys) { NativeBridge.keys(handle, keys); }
@@ -259,9 +247,88 @@ public final class MainActivity extends Activity {
         play.requestApplyInsets();
         immersive();
         heartbeat.run();
-        Log.i("LanStream", "Connected " + info.game + " " + info.width + "x" + info.height + " " + info.encoder + " profile=" + layout.mode);
+        Log.i("LanStream", "Connected " + info.game + " " + info.width + "x" + info.height + " " + info.encoder + " profile=" + layout.mode + " transport=" + (info.udpVideo ? "UDP/FEC" : "TCP") + " fps=" + info.fps + " immediate=" + info.lowLatency);
         if (profile.mode == Profile.Mode.PHONE && !info.phoneAspect) {
             Toast.makeText(this, "游戏窗口保留原画幅，已完整显示。", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void attachVideo(long handle, Stream info, int token) {
+        if (info.lowLatency) {
+            preferDisplayMode(info.fps);
+            directView = new SurfaceView(this);
+            directView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            SurfaceHolder target = directView.getHolder();
+            target.setFixedSize(info.width, info.height);
+            target.addCallback(new SurfaceHolder.Callback() {
+                @Override public void surfaceCreated(SurfaceHolder holder) {}
+                @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                    if (generation == token && media == null && holder.getSurface().isValid()) {
+                        startMedia(handle, info, token, holder.getSurface(), false);
+                    }
+                }
+                @Override public void surfaceDestroyed(SurfaceHolder holder) { surfaceLost(token); }
+            });
+            play.addView(directView, new FrameLayout.LayoutParams(-1, -1));
+        } else {
+            texture = new TextureView(this);
+            texture.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+                @Override public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+                    if (generation != token || media != null) return;
+                    surface.setDefaultBufferSize(info.width, info.height);
+                    startMedia(handle, info, token, new Surface(surface), true);
+                }
+                @Override public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) { updateGeometry(); }
+                @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) { surfaceLost(token); return true; }
+                @Override public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+                    if (generation == token && media != null) media.displayedFrame(System.nanoTime());
+                }
+            });
+            play.addView(texture, new FrameLayout.LayoutParams(-1, -1));
+        }
+    }
+
+    private void startMedia(long handle, Stream info, int token, Surface destination, boolean owned) {
+        media = new MediaRunner(handle, destination, info.width, info.height, info.fps, muted, info.udpVideo, info.lowLatency, owned,
+            (reason, tcpFallback) -> ui.post(() -> {
+                if (generation != token) return;
+                if (tcpFallback) {
+                    long now = System.nanoTime();
+                    preferUdp = lastUdpRetry == 0 || now - lastUdpRetry > 30_000_000_000L;
+                    if (preferUdp) lastUdpRetry = now;
+                }
+                reconnect(tcpFallback && preferUdp ? "正在恢复低延迟视频连接…" : reason);
+            }),
+            (x, y) -> ui.post(() -> {
+                if (generation != token) return;
+                sourceInsetX = x;
+                sourceInsetY = y;
+                updateGeometry();
+            }));
+        Log.i("LanStream", "Output surface=" + (owned ? "TextureView" : "SurfaceView"));
+        media.start();
+        updateGeometry();
+    }
+
+    private void surfaceLost(int token) {
+        if (generation == token) ui.post(() -> { if (generation == token) reconnect("画面已暂停，正在重新连接…"); });
+    }
+
+    private void preferDisplayMode(int fps) {
+        Display display = getWindowManager().getDefaultDisplay();
+        Display.Mode current = display.getMode();
+        for (Display.Mode mode : display.getSupportedModes()) {
+            if (mode.getPhysicalWidth() != current.getPhysicalWidth() || mode.getPhysicalHeight() != current.getPhysicalHeight()
+                || Math.abs(mode.getRefreshRate() - fps) > 1f) continue;
+            WindowManager.LayoutParams window = getWindow().getAttributes();
+            displayModeBefore = window.preferredDisplayModeId;
+            refreshBefore = window.preferredRefreshRate;
+            displayModeRequested = true;
+            window.preferredDisplayModeId = mode.getModeId();
+            window.preferredRefreshRate = mode.getRefreshRate();
+            getWindow().setAttributes(window);
+            Log.i("LanStream", "Requested app refresh " + mode.getRefreshRate());
+            break;
         }
     }
 
@@ -286,10 +353,22 @@ public final class MainActivity extends Activity {
         VideoPlacement.Strategy strategy = cover ? VideoPlacement.Strategy.FILL : VideoPlacement.Strategy.FIT;
         VideoPlacement placement = VideoPlacement.place(width, height, stream.width, stream.height,
             useContent ? sourceInsetX : 0, useContent ? sourceInsetY : 0, rail, strategy);
-        Matrix transform = new Matrix();
-        transform.setScale(placement.width / width, placement.height / height);
-        transform.postTranslate(placement.left, placement.top);
-        texture.setTransform(transform);
+        if (directView != null) {
+            FrameLayout.LayoutParams position = (FrameLayout.LayoutParams)directView.getLayoutParams();
+            int drawWidth = Math.round(placement.width), drawHeight = Math.round(placement.height);
+            int left = Math.round(placement.left), top = Math.round(placement.top);
+            if (position.width != drawWidth || position.height != drawHeight || position.leftMargin != left || position.topMargin != top) {
+                position.width = drawWidth; position.height = drawHeight;
+                position.leftMargin = left; position.topMargin = top;
+                position.gravity = Gravity.TOP | Gravity.LEFT;
+                directView.setLayoutParams(position);
+            }
+        } else if (texture != null) {
+            Matrix transform = new Matrix();
+            transform.setScale(placement.width / width, placement.height / height);
+            transform.postTranslate(placement.left, placement.top);
+            texture.setTransform(transform);
+        }
         RectF full = new RectF(placement.left, placement.top, placement.left + placement.width, placement.top + placement.height);
         RectF picture = new RectF(placement.pictureLeft, placement.pictureTop,
             placement.pictureLeft + placement.pictureWidth, placement.pictureTop + placement.pictureHeight);
@@ -438,7 +517,14 @@ public final class MainActivity extends Activity {
         ui.removeCallbacks(autoRetry);
         if (overlay != null) overlay.reset();
         if (media != null) media.stop(); else if (session != 0) NativeBridge.close(session);
-        media = null; session = 0; play = null; texture = null; overlay = null; stream = null; profile = null; editing = false; connecting = false;
+        media = null; session = 0; play = null; texture = null; directView = null; overlay = null; stream = null; profile = null; editing = false; connecting = false;
+        if (displayModeRequested) {
+            displayModeRequested = false;
+            WindowManager.LayoutParams window = getWindow().getAttributes();
+            window.preferredDisplayModeId = displayModeBefore;
+            window.preferredRefreshRate = refreshBefore;
+            getWindow().setAttributes(window);
+        }
     }
 
     private Point realSize() {
@@ -501,11 +587,15 @@ public final class MainActivity extends Activity {
         final String game, title, encoder;
         final int width, height, fps;
         final boolean phoneAspect;
+        final boolean udpVideo;
+        final boolean lowLatency;
         Stream(String metadata) throws Exception {
             JSONObject info = new JSONObject(metadata);
             game = info.getString("game_id"); title = info.getString("title"); encoder = info.getString("encoder");
             width = info.getInt("width"); height = info.getInt("height"); fps = info.getInt("fps");
             phoneAspect = info.getBoolean("phone_aspect");
+            udpVideo = info.optBoolean("udp_video");
+            lowLatency = info.optBoolean("low_latency");
             if (width < 64 || width > 1920 || height < 64 || height > 1080 || fps < 1 || fps > 120) throw new IllegalArgumentException("主机画面参数超出范围");
         }
     }
