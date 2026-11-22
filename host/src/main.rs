@@ -65,7 +65,7 @@ fn options() -> Result<Option<Options>> {
             "--quality" => result.quality = args.next().context("--quality 缺少设置")?.parse()?,
             "--help" | "-h" => {
                 println!(
-                    "局域网游戏串流主机\n\nlan-stream-host.exe [--config 游戏配置路径] [--bind 局域网 IPv4] [--port 24865] [--quality auto|smooth|balanced|sharp|latency]\nlan-stream-host.exe --list"
+                    "局域网游戏串流主机\n\nlan-stream-host.exe [--config 游戏配置路径] [--bind 局域网 IPv4] [--port 24865] [--quality auto|smooth|balanced|sharp|latency|native]\nlan-stream-host.exe --list"
                 );
                 return Ok(None);
             }
@@ -83,6 +83,7 @@ struct Entry {
     key: String,
     #[serde(default)]
     xbox: bool,
+    native_aspect: Option<String>,
 }
 
 struct Game {
@@ -90,6 +91,7 @@ struct Game {
     exe: PathBuf,
     key: Secret,
     xbox: bool,
+    native_aspect: Option<(u16, u16)>,
 }
 
 fn games(path: &PathBuf) -> Result<HashMap<String, Game>> {
@@ -103,6 +105,12 @@ fn games(path: &PathBuf) -> Result<HashMap<String, Game>> {
             bail!("游戏配置含有无效标识、标题或 EXE 路径");
         }
         let key = parse_secret(&entry.key).context("游戏配置中有无效的配对密钥")?;
+        let native_aspect = entry
+            .native_aspect
+            .as_deref()
+            .map(video::parse_aspect)
+            .transpose()
+            .context("游戏原始画幅无效")?;
         if result
             .insert(
                 entry.id,
@@ -111,6 +119,7 @@ fn games(path: &PathBuf) -> Result<HashMap<String, Game>> {
                     exe: entry.exe,
                     key,
                     xbox: entry.xbox,
+                    native_aspect,
                 },
             )
             .is_some()
@@ -284,6 +293,14 @@ fn session(
         None
     };
     let quality = quality.resolve(lane.is_some());
+    let native_window = (quality.native_pixels() && hello.native_resolution)
+        .then(|| video::native_picture_size(hello.viewport, game.native_aspect))
+        .flatten();
+    let quality = if quality.native_pixels() && native_window.is_none() {
+        Quality::Latency
+    } else {
+        quality
+    };
     let low_latency = quality.low_latency();
     let refresh = window::refresh_rate(&target);
     let fps = if low_latency && refresh >= 119 {
@@ -293,13 +310,26 @@ fn session(
     };
     let _resize = WindowResize::apply(
         &target,
-        hello.viewport,
-        if low_latency { 1600 } else { 1920 },
+        native_window.unwrap_or(hello.viewport),
+        native_window.map_or(if low_latency { 1600 } else { 1920 }, |size| {
+            i32::from(size.0)
+        }),
+        native_window.is_some(),
     );
     if _resize.is_some() {
         thread::sleep(Duration::from_millis(300));
     }
-    let started = match start_video(&target, encoder, quality, fps, hello.content_updates) {
+    let locked_aspect = native_window.is_some()
+        && game.native_aspect.is_some_and(|(w, h)| {
+            window::client_geometry(target.hwnd()).is_some_and(|(width, height, _)| {
+                height > 0
+                    && (f64::from(width) / f64::from(height) * f64::from(h) / f64::from(w) - 1.0)
+                        .abs()
+                        < 0.008
+            })
+        });
+    let detect_bars = hello.content_updates && !locked_aspect;
+    let started = match start_video(&target, encoder, quality, fps, detect_bars) {
         Ok(started) => started,
         Err(error) => {
             send(&mut socket, ERROR, error.to_string().as_bytes())?;
@@ -307,6 +337,20 @@ fn session(
         }
     };
     let (width, height) = started.size;
+    if let Some((w, h)) = native_window {
+        println!(
+            "目标内容 {}×{}，编码 {}×{}{}",
+            w,
+            h,
+            width,
+            height,
+            if (u32::from(w), u32::from(h)) == (width, height) {
+                "（逐像素显示）"
+            } else {
+                ""
+            }
+        );
+    }
     let desired = f64::from(hello.viewport.0) / f64::from(hello.viewport.1);
     let axes = lane
         .as_ref()
@@ -318,7 +362,7 @@ fn session(
         title: game.title.clone(),
         width,
         height,
-        fps,
+        fps: started.fps,
         encoder: started.encoder.into(),
         phone_aspect: desired.is_finite() && (active / desired - 1.0).abs() < 0.02,
         udp_video: lane.is_some(),
@@ -331,7 +375,7 @@ fn session(
         started.capture,
         &info,
         StreamFeatures {
-            content_updates: hello.content_updates,
+            content_updates: detect_bars,
             compact_audio: hello.fast_video,
             lane,
             axes,
@@ -343,6 +387,7 @@ fn session(
 
 struct StartedVideo {
     size: (u32, u32),
+    fps: u32,
     encoder: &'static str,
     capture: VideoCapture,
 }
@@ -379,6 +424,7 @@ fn start_video(
                 println!("D3D11 纹理直送 NVENC · {}", gpu.adapter);
                 return Ok(StartedVideo {
                     size: gpu.size,
+                    fps,
                     encoder: gpu_video::GpuVideo::ENCODER,
                     capture: VideoCapture::Gpu(gpu),
                 });
@@ -386,6 +432,11 @@ fn start_video(
             Err(error) => eprintln!("D3D11 直送暂不可用，使用 FFmpeg：{error:#}"),
         }
     }
+    let fps = if quality.native_pixels() {
+        video::FPS
+    } else {
+        fps
+    };
     let capture = Capture::start(target, bars, fps)?;
     let first = capture.slot.first()?;
     let size = video::output_size(first.width, first.height, quality);
@@ -398,6 +449,7 @@ fn start_video(
     let child = encoder.start(&first, size.0, size.1, quality, fps, endpoint.as_deref())?;
     Ok(StartedVideo {
         size,
+        fps,
         encoder: encoder.name(),
         capture: VideoCapture::Ffmpeg {
             capture,
@@ -455,6 +507,7 @@ fn stream(
         pad,
     } = features;
     let (tx, rx) = sync_channel::<(u8, Vec<u8>)>(12);
+    let audio = audio::AudioSession::start(target.pid, tx.clone(), compact_audio);
     thread::scope(|group| {
         let stop_ref = &stop;
         let acknowledgement = tx.clone();
@@ -476,13 +529,6 @@ fn stream(
                 }
             });
         }
-        let audio_sender = tx.clone();
-        group.spawn(|| {
-            if let Err(error) = audio::capture(target.pid, &stop, audio_sender, compact_audio) {
-                eprintln!("游戏进程音频不可用：{error:#}");
-            }
-            teardown("audio stopped");
-        });
         let count = &encoded_frames;
         let capture_source = &capture;
         group.spawn(move || {
@@ -571,6 +617,7 @@ fn stream(
             }
         };
         stop.store(true, Ordering::Relaxed);
+        audio.stop();
         if let Some(axes) = &axes {
             axes.stop();
         }

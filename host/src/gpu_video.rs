@@ -29,6 +29,7 @@ use windows::core::{IInspectable, Interface, factory};
 use windows_capture::d3d11::{StagingTexture, create_direct3d_device};
 
 unsafe extern "C" {
+    fn lan_keep_graphics_capture_loaded();
     fn lan_nvenc_create(
         device: *mut c_void,
         texture: *mut c_void,
@@ -36,6 +37,7 @@ unsafe extern "C" {
         height: u32,
         fps: u32,
         bitrate: u32,
+        spatial_aq: i32,
         result: *mut *mut c_void,
     ) -> i32;
     fn lan_nvenc_picture(
@@ -56,8 +58,10 @@ impl TextureEncoder {
         texture: &ID3D11Texture2D,
         size: (u32, u32),
         fps: u32,
+        quality: Quality,
     ) -> Result<Self> {
         let mut handle = null_mut();
+        let (bitrate, spatial_aq) = quality.nvenc_quality();
         let code = unsafe {
             lan_nvenc_create(
                 device.as_raw(),
@@ -65,7 +69,8 @@ impl TextureEncoder {
                 size.0,
                 size.1,
                 fps,
-                7_000_000,
+                bitrate,
+                i32::from(spatial_aq),
                 &mut handle,
             )
         };
@@ -130,16 +135,52 @@ pub struct GpuVideo {
     worker: Option<JoinHandle<()>>,
 }
 
+static GPU_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct GpuCaptureLease;
+
+impl GpuCaptureLease {
+    fn acquire() -> Result<Self> {
+        GPU_CAPTURE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow!("上一次 D3D11 会话仍在释放"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for GpuCaptureLease {
+    fn drop(&mut self) {
+        GPU_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn finish_worker(worker: JoinHandle<()>) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if worker.is_finished() {
+        let _ = worker.join();
+        crate::teardown("GPU worker joined");
+    } else {
+        // The driver may still be cleaning up. Keep accepting clients, and let the lease
+        // route the next session to the compatible encoder until this worker actually exits.
+        crate::teardown("GPU worker still closing; listener released");
+    }
+}
+
 impl GpuVideo {
     pub const ENCODER: &str = "nvenc-d3d11";
 
     pub fn open(target: &Target, fps: u32, quality: Quality, detect_bars: bool) -> Result<Self> {
+        let lease = GpuCaptureLease::acquire()?;
         let shared = Arc::new(Shared::default());
         let (ready, startup) = sync_channel(1);
         let (encoded, packets) = sync_channel(4);
         let target = target.clone();
         let state = shared.clone();
         let worker = thread::spawn(move || {
+            let _lease = lease;
             if let Err(error) =
                 capture(&target, fps, quality, detect_bars, &state, &ready, &encoded)
             {
@@ -158,7 +199,7 @@ impl GpuVideo {
             }),
             failure => {
                 shared.stop.store(true, Ordering::Relaxed);
-                let _ = worker.join();
+                finish_worker(worker);
                 match failure {
                     Ok(Err(error)) => Err(error),
                     _ => bail!("等待 NVIDIA D3D11 首帧超时"),
@@ -197,9 +238,8 @@ impl Drop for GpuVideo {
         self.stop();
         crate::teardown("waiting for GPU worker");
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            finish_worker(worker);
         }
-        crate::teardown("GPU worker joined");
     }
 }
 
@@ -251,6 +291,7 @@ impl WindowFrames {
             token,
         };
         video.session.StartCapture()?;
+        unsafe { lan_keep_graphics_capture_loaded() };
         Ok(video)
     }
 
@@ -278,7 +319,25 @@ impl Drop for WindowFrames {
     }
 }
 
-fn nvidia_device() -> Result<(ID3D11Device, ID3D11DeviceContext, String)> {
+type NvidiaDevice = (ID3D11Device, ID3D11DeviceContext, String);
+// Keep one adapter alive across video sessions. The capture lease serializes use
+// of its immediate context, and the driver can finish retiring resources without
+// unloading the device while a client is reconnecting.
+static NVIDIA_DEVICE: Mutex<Option<NvidiaDevice>> = Mutex::new(None);
+
+fn nvidia_device() -> Result<NvidiaDevice> {
+    let mut cached = NVIDIA_DEVICE.lock().unwrap();
+    if let Some(device) = cached.as_ref()
+        && unsafe { device.0.GetDeviceRemovedReason() }.is_ok()
+    {
+        return Ok(device.clone());
+    }
+    let device = create_nvidia_device()?;
+    *cached = Some(device.clone());
+    Ok(device)
+}
+
+fn create_nvidia_device() -> Result<NvidiaDevice> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     for number in 0..32 {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(number) }) else {
@@ -385,6 +444,7 @@ fn capture(
     let first = frames
         .next(Duration::from_secs(2))
         .context("NVIDIA D3D11 取画没有首帧")?;
+    unsafe { lan_keep_graphics_capture_loaded() };
     let (source, area) = texture_and_crop(target, &first)?;
     let source_size = (area.right - area.left, area.bottom - area.top);
     let size = output_size(source_size.0, source_size.1, quality);
@@ -395,7 +455,7 @@ fn capture(
     }
     drop(first);
     converter.convert()?;
-    let encoder = TextureEncoder::new(&device, converter.texture(), size, fps)?;
+    let encoder = TextureEncoder::new(&device, converter.texture(), size, fps, quality)?;
     let seed = encoder.picture(0, true)?;
     if seed.is_empty() {
         bail!("NVENC D3D11 没有立即输出首帧");
@@ -421,6 +481,9 @@ fn capture(
     while !shared.stop.load(Ordering::Relaxed) && target.exists() {
         if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             thread::sleep(remaining);
+        }
+        if shared.stop.load(Ordering::Relaxed) {
+            break;
         }
         let now = Instant::now();
         if now.saturating_duration_since(deadline) > interval {
@@ -610,7 +673,8 @@ mod gpu_color_test {
         let size = (320_u32, 192_u32);
         let texture = input_texture(&device, size).unwrap();
         let converter = Nv12Converter::new(&device, &context, &texture, size, size, 120).unwrap();
-        let encoder = TextureEncoder::new(&device, converter.texture(), size, 120).unwrap();
+        let encoder =
+            TextureEncoder::new(&device, converter.texture(), size, 120, Quality::Latency).unwrap();
         let samples: [[u8; 3]; 8] = [
             [0, 0, 0],
             [32, 32, 32],

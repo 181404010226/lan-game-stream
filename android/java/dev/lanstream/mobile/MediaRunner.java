@@ -224,7 +224,7 @@ final class MediaRunner {
             }
         } catch (Exception failure) {
             if (active.get()) Log.w("LanStream", "Decoder ended", failure);
-            end("手机解码中断，正在重新连接…", false);
+            end("手机解码中断，正在重新连接…", udpVideo && (width > 1920 || height > 1080));
         } finally {
             if (decoder != null) {
                 try { decoder.stop(); } catch (IllegalStateException ignored) {}

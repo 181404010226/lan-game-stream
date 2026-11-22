@@ -1,9 +1,63 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::thread;
+use std::time::{Duration, Instant};
 use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat, initialize_mta};
 
-pub fn capture(
+static AUDIO_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct AudioLease;
+impl Drop for AudioLease {
+    fn drop(&mut self) {
+        AUDIO_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+pub struct AudioSession {
+    stop: Arc<AtomicBool>,
+}
+
+impl AudioSession {
+    pub fn start(pid: u32, packets: SyncSender<(u8, Vec<u8>)>, compact: bool) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = stop.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !cancelled.load(Ordering::Relaxed) {
+                if AUDIO_ACTIVE
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let _lease = AudioLease;
+                    if let Err(error) = capture(pid, &cancelled, packets, compact) {
+                        eprintln!("游戏进程音频不可用：{error:#}");
+                    }
+                    crate::teardown("audio stopped");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Self { stop }
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AudioSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn capture(
     pid: u32,
     stop: &AtomicBool,
     packets: SyncSender<(u8, Vec<u8>)>,
@@ -24,11 +78,11 @@ pub fn capture(
     let mut notified = false;
     client.start_stream()?;
     while !stop.load(Ordering::Relaxed) {
-        while capture.get_next_packet_size()?.unwrap_or(0) != 0 {
+        while !stop.load(Ordering::Relaxed) && capture.get_next_packet_size()?.unwrap_or(0) != 0 {
             capture.read_from_device_to_deque(&mut samples)?;
         }
         // 10 ms of stereo, 48 kHz. Send little-endian PCM to Android AudioTrack.
-        while samples.len() >= 3840 {
+        while !stop.load(Ordering::Relaxed) && samples.len() >= 3840 {
             let raw = samples.drain(..3840).collect::<Vec<_>>();
             let mut pcm = Vec::with_capacity(1920);
             for chunk in raw.chunks_exact(4) {

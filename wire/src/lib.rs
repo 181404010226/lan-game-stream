@@ -9,6 +9,7 @@ pub mod udp;
 const LEGACY_MAGIC: [u8; 4] = *b"LGS2";
 const MAGIC: [u8; 4] = *b"LGS3";
 const FAST_MAGIC: [u8; 4] = *b"LGS4";
+const NATIVE_RESOLUTION_MAGIC: [u8; 4] = *b"LGS5";
 const DISCOVERY: [u8; 4] = *b"LGD2";
 pub const PORT: u16 = 24865;
 pub const MAX_MEDIA: usize = 2 * 1024 * 1024;
@@ -58,12 +59,15 @@ pub struct Hello {
     pub viewport: (u16, u16),
     pub content_updates: bool,
     pub fast_video: bool,
+    pub native_resolution: bool,
 }
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(25 + self.game.len());
-        bytes.extend_from_slice(if self.fast_video {
+        bytes.extend_from_slice(if self.fast_video && self.native_resolution {
+            &NATIVE_RESOLUTION_MAGIC
+        } else if self.fast_video {
             &FAST_MAGIC
         } else if self.content_updates {
             &MAGIC
@@ -85,7 +89,8 @@ impl Hello {
     pub fn read(input: &mut impl Read) -> io::Result<Self> {
         let mut bytes = [0; 25];
         input.read_exact(&mut bytes)?;
-        let fast_video = bytes[..4] == FAST_MAGIC;
+        let native_resolution = bytes[..4] == NATIVE_RESOLUTION_MAGIC;
+        let fast_video = native_resolution || bytes[..4] == FAST_MAGIC;
         let content_updates = bytes[..4] == MAGIC || fast_video;
         if !content_updates && bytes[..4] != LEGACY_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "协议版本不匹配"));
@@ -109,6 +114,7 @@ impl Hello {
             ),
             content_updates,
             fast_video,
+            native_resolution,
         })
     }
 }
@@ -249,6 +255,7 @@ mod tests {
             viewport: (2800, 1260),
             content_updates: true,
             fast_video: true,
+            native_resolution: true,
         };
         hello.write(&mut bytes).unwrap();
         let received = Hello::read(&mut bytes.as_slice()).unwrap();
@@ -257,9 +264,11 @@ mod tests {
         assert_eq!(received.viewport, hello.viewport);
         assert!(received.content_updates);
         assert!(received.fast_video);
+        assert!(received.native_resolution);
         let original = Hello {
             content_updates: false,
             fast_video: false,
+            native_resolution: false,
             ..hello
         };
         assert!(

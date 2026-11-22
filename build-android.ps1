@@ -5,6 +5,7 @@ param(
     [string]$HostConfig,
     [string]$HostHint = '',
     [switch]$Xbox,
+    [ValidatePattern('^(?:[1-9]\d{0,2}:[1-9]\d{0,2})?$')][string]$NativeAspect,
     [ValidateRange(1,65535)][int]$Port = 24865,
     [ValidateSet('arm64-v8a','x86_64')][string[]]$Abi = @('arm64-v8a','x86_64'),
     [string]$Sdk,
@@ -72,8 +73,16 @@ if ($bound) {
 if ($secret -notmatch '^[a-fA-F0-9]{64}$') { throw '已有游戏的配对密钥格式有误。' }
 $xboxEnabled = if ($PSBoundParameters.ContainsKey('Xbox')) { [bool]$Xbox } elseif ($bound) { [bool]$bound['xbox'] } else { $false }
 $xboxLiteral = $xboxEnabled.ToString().ToLowerInvariant()
+$aspect = if ($PSBoundParameters.ContainsKey('NativeAspect')) { $NativeAspect } elseif ($bound) { $bound['native_aspect'] } else { $null }
+if ($aspect) {
+    $size = $aspect.Split(':')
+    $ratio = [double]$size[0] / [double]$size[1]
+    if ($ratio -lt 1.3 -or $ratio -gt 3.0) { throw '游戏画幅需要在 1.3:1 到 3:1 之间。' }
+}
 $updatedBindings = @($bindings | Where-Object { $_.id -ne $AppSlug })
-$updatedBindings += [ordered]@{ id = $AppSlug; title = $GameName; exe = $gameExe.FullName; key = $secret; xbox = $xboxEnabled }
+$updated = [ordered]@{ id = $AppSlug; title = $GameName; exe = $gameExe.FullName; key = $secret; xbox = $xboxEnabled }
+if ($aspect) { $updated['native_aspect'] = $aspect }
+$updatedBindings += $updated
 $applicationId = "dev.lanstream.mobile.$AppSlug"
 $stage = Join-Path 'build' "apk-$([Guid]::NewGuid().ToString('N'))"
 $generated = Join-Path $stage 'generated'

@@ -40,6 +40,7 @@ impl Client {
         secret: Secret,
         viewport: (u16, u16),
         fast_video: bool,
+        native_resolution: bool,
     ) -> io::Result<Self> {
         let request = discovery_request(&game, nonce()?);
         let ip = discover(address_hint, port, &request, &secret)
@@ -57,6 +58,7 @@ impl Client {
             viewport,
             content_updates: true,
             fast_video,
+            native_resolution,
         };
         hello.write(&mut socket)?;
         let mut reader = Reader {
@@ -297,7 +299,19 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_open(
             .filter(|port| *port > 0)
             .ok_or_else(|| io::Error::other("端口无效"))?;
         let fast = fast_video != 0;
-        match Client::connect(hint, port, game.clone(), secret, size, fast) {
+        let open =
+            |video, native| Client::connect(hint, port, game.clone(), secret, size, video, native);
+        let compatibility_error = |error: &io::Error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+            )
+        };
+        let preferred = match open(fast, fast) {
+            Err(error) if fast && compatibility_error(&error) => open(true, false),
+            result => result,
+        };
+        match preferred {
             Err(error)
                 if fast
                     && matches!(
@@ -305,7 +319,7 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_open(
                         io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
                     ) =>
             {
-                Client::connect(hint, port, game, secret, size, false)
+                open(false, false)
             }
             result => result,
         }

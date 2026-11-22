@@ -320,6 +320,7 @@ pub enum Quality {
     Balanced,
     Sharp,
     Latency,
+    Native,
 }
 
 impl FromStr for Quality {
@@ -331,7 +332,8 @@ impl FromStr for Quality {
             "balanced" => Ok(Self::Balanced),
             "sharp" => Ok(Self::Sharp),
             "latency" => Ok(Self::Latency),
-            _ => bail!("--quality 应为 auto、smooth、balanced、sharp 或 latency"),
+            "native" => Ok(Self::Native),
+            _ => bail!("--quality 应为 auto、smooth、balanced、sharp、latency 或 native"),
         }
     }
 }
@@ -341,7 +343,7 @@ impl Quality {
         match self {
             Self::Auto if udp => Self::Balanced,
             Self::Auto => Self::Smooth,
-            Self::Latency if !udp => Self::Smooth,
+            Self::Latency | Self::Native if !udp => Self::Smooth,
             selected => selected,
         }
     }
@@ -349,6 +351,7 @@ impl Quality {
     fn limits(self) -> (f64, f64) {
         match self {
             Self::Smooth | Self::Latency => (1600.0, 900.0),
+            Self::Native => (3840.0, 2160.0),
             _ => (1920.0, 1080.0),
         }
     }
@@ -358,12 +361,59 @@ impl Quality {
             Self::Smooth => ("4500k", "180k"),
             Self::Sharp => ("10M", "400k"),
             Self::Latency => ("7M", "160k"),
+            Self::Native => ("18M", "300k"),
             _ => ("6500k", "260k"),
         }
     }
 
     pub fn low_latency(self) -> bool {
-        matches!(self, Self::Latency)
+        matches!(self, Self::Latency | Self::Native)
+    }
+
+    pub fn native_pixels(self) -> bool {
+        matches!(self, Self::Native)
+    }
+
+    pub fn nvenc_quality(self) -> (u32, bool) {
+        if self.native_pixels() {
+            (18_000_000, true)
+        } else {
+            (7_000_000, false)
+        }
+    }
+}
+
+pub fn parse_aspect(value: &str) -> Result<(u16, u16)> {
+    let (width, height) = value.split_once(':').context("游戏画幅示例为 16:9")?;
+    let (width, height) = (width.parse::<u16>()?, height.parse::<u16>()?);
+    if !(1.3..=3.0).contains(&(f64::from(width) / f64::from(height))) {
+        bail!("游戏画幅需要在 1.3:1 到 3:1 之间");
+    }
+    Ok((width, height))
+}
+
+pub fn native_picture_size(viewport: (u16, u16), aspect: Option<(u16, u16)>) -> Option<(u16, u16)> {
+    let (width, height) = (viewport.0.min(3840), viewport.1.min(2160));
+    if width < 320 || height < 240 {
+        return None;
+    }
+    let (aspect_width, aspect_height) = aspect.unwrap_or(viewport);
+    if !(1.3..=3.0).contains(&(f64::from(aspect_width) / f64::from(aspect_height))) {
+        return None;
+    }
+    let (mut a, mut b) = (aspect_width, aspect_height);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let (unit_width, unit_height) = (aspect_width / a, aspect_height / a);
+    let scale = (width / unit_width).min(height / unit_height) & !1;
+    let size = (unit_width * scale, unit_height * scale);
+    if size.0 >= 320 && size.1 >= 240 {
+        Some(size)
+    } else if aspect.is_none() {
+        Some((width & !1, height & !1))
+    } else {
+        None
     }
 }
 
@@ -585,6 +635,23 @@ fn next_aud(bytes: &[u8], from: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_picture_uses_exact_even_pixels_within_the_phone() {
+        let aspect = parse_aspect("16:9").unwrap();
+        assert_eq!(
+            native_picture_size((2800, 1260), Some(aspect)),
+            Some((2240, 1260))
+        );
+        assert_eq!(native_picture_size((2800, 1260), None), Some((2800, 1260)));
+        assert_eq!(
+            native_picture_size((1280, 720), Some(aspect)),
+            Some((1280, 720))
+        );
+        assert_eq!(native_picture_size((0, 0), Some(aspect)), None);
+        assert_eq!(output_size(2240, 1260, Quality::Native), (2240, 1260));
+        assert!(parse_aspect("16:0").is_err());
+    }
 
     #[test]
     fn annex_b_delimiters_split_pictures() {

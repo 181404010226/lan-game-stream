@@ -596,7 +596,7 @@ public final class MainActivity extends Activity {
             phoneAspect = info.getBoolean("phone_aspect");
             udpVideo = info.optBoolean("udp_video");
             lowLatency = info.optBoolean("low_latency");
-            if (width < 64 || width > 1920 || height < 64 || height > 1080 || fps < 1 || fps > 120) throw new IllegalArgumentException("主机画面参数超出范围");
+            if (width < 64 || width > 3840 || height < 64 || height > 2160 || fps < 1 || fps > 120) throw new IllegalArgumentException("主机画面参数超出范围");
         }
     }
 }

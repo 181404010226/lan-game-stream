@@ -216,7 +216,12 @@ pub struct WindowResize {
 }
 
 impl WindowResize {
-    pub fn apply(target: &Target, viewport: (u16, u16), capture_width: i32) -> Option<Self> {
+    pub fn apply(
+        target: &Target,
+        viewport: (u16, u16),
+        capture_width: i32,
+        exact_pixels: bool,
+    ) -> Option<Self> {
         let aspect = f64::from(viewport.0) / f64::from(viewport.1);
         if !(1.3..=3.0).contains(&aspect) {
             return None;
@@ -240,16 +245,23 @@ impl WindowResize {
         }
         let work = info.rcWork;
         let (client_width, client_height, _) = client_geometry(hwnd)?;
-        if client_height > 0
+        if !exact_pixels
+            && client_height > 0
             && client_width <= capture_width
             && (f64::from(client_width) / f64::from(client_height) / aspect - 1.0).abs() < 0.015
         {
             return None;
         }
         let max_width = (work.right - work.left - 80).clamp(240, capture_width);
-        let max_height = (work.bottom - work.top - 100).clamp(180, 1080);
-        let height = client_height
-            .max(i32::from(viewport.1))
+        let wanted_height = i32::from(viewport.1);
+        let max_height = (work.bottom - work.top - 100)
+            .clamp(180, if exact_pixels { wanted_height } else { 1080 });
+        let preferred_height = if exact_pixels {
+            wanted_height
+        } else {
+            client_height.max(wanted_height)
+        };
+        let height = preferred_height
             .min(max_height)
             .min((f64::from(max_width) / aspect) as i32)
             & !1;
@@ -257,6 +269,9 @@ impl WindowResize {
             return None;
         }
         let width = ((f64::from(height) * aspect).round() as i32) & !1;
+        if (client_width, client_height) == (width, height) {
+            return None;
+        }
         let mut adjusted = RECT {
             left: 0,
             top: 0,
@@ -328,9 +343,9 @@ impl Drop for WindowResize {
                 old.top,
                 old.right - old.left,
                 old.bottom - old.top,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
             )
         };
-        crate::teardown("game window restored");
+        crate::teardown("game window restore queued");
     }
 }

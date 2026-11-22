@@ -30,13 +30,23 @@ static void keep_hybrid_graphics_shim_loaded() {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvdlistx.dll", &shim);
 }
 
+extern "C" void lan_keep_graphics_capture_loaded() {
+    // A free-threaded capture pool can still have a callback on its way out
+    // after Close. Retain the Windows capture provider for the host lifetime.
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"GraphicsCapture.dll", &module)) {
+        static HMODULE system_module = LoadLibraryExW(L"GraphicsCapture.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        (void)system_module;
+    }
+}
+
 static int failure(LanNvenc* session, int stage, NVENCSTATUS status) {
     delete session;
     return stage * 1000 + static_cast<int>(status);
 }
 
 extern "C" int lan_nvenc_create(void* device, void* texture, unsigned width, unsigned height,
-    unsigned fps, unsigned bitrate, void** result) {
+    unsigned fps, unsigned bitrate, int spatial_aq, void** result) {
     *result = nullptr;
     auto* session = new(std::nothrow) LanNvenc;
     if (!session) return 1000 + NV_ENC_ERR_OUT_OF_MEMORY;
@@ -84,6 +94,10 @@ extern "C" int lan_nvenc_create(void* device, void* texture, unsigned width, uns
     config.rcParams.enableLookahead = 0;
     config.rcParams.lookaheadDepth = 0;
     config.rcParams.zeroReorderDelay = 1;
+    if (spatial_aq) {
+        config.rcParams.enableAQ = 1;
+        config.rcParams.aqStrength = 8;
+    }
     auto& h264 = config.encodeCodecConfig.h264Config;
     h264.idrPeriod = config.gopLength;
     h264.repeatSPSPPS = 1;
