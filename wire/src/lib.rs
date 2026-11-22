@@ -32,7 +32,8 @@ pub const KEYS: u8 = 16;
 pub const POINTER: u8 = 17;
 pub const GAMEPAD: u8 = 18;
 pub const PING: u8 = 19;
-const STANDARD_PAD_BUTTONS: u16 = 0xf3ff;
+pub const PAD_BUTTONS: u8 = 20;
+pub const STANDARD_PAD_BUTTONS: u16 = 0xf3ff;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamInfo {
@@ -47,6 +48,8 @@ pub struct StreamInfo {
     pub udp_video: bool,
     #[serde(default)]
     pub low_latency: bool,
+    #[serde(default)]
+    pub udp_axes: bool,
 }
 
 pub struct Hello {

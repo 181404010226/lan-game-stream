@@ -6,8 +6,43 @@ use std::time::{Duration, Instant};
 const HEADER: usize = 19;
 const FRAGMENT: usize = 1136;
 const GROUP: usize = 8;
+const INTERLEAVE_GROUPS: usize = 4;
 const WINDOW: u32 = 7;
 pub const MAX_DATAGRAM: usize = HEADER + FRAGMENT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Axes {
+    pub sequence: u32,
+    pub x: i16,
+    pub y: i16,
+}
+
+impl Axes {
+    pub fn packet(self, cookie: [u8; 8]) -> [u8; 18] {
+        let mut packet = [0; 18];
+        packet[..8].copy_from_slice(&cookie);
+        packet[8..10].copy_from_slice(b"AX");
+        packet[10..14].copy_from_slice(&self.sequence.to_be_bytes());
+        packet[14..16].copy_from_slice(&self.x.to_be_bytes());
+        packet[16..18].copy_from_slice(&self.y.to_be_bytes());
+        packet
+    }
+
+    pub fn parse(packet: &[u8], cookie: [u8; 8]) -> Option<Self> {
+        if packet.len() != 18 || packet[..8] != cookie || packet[8..10] != *b"AX" {
+            return None;
+        }
+        Some(Self {
+            sequence: u32::from_be_bytes(packet[10..14].try_into().ok()?),
+            x: i16::from_be_bytes(packet[14..16].try_into().ok()?),
+            y: i16::from_be_bytes(packet[16..18].try_into().ok()?),
+        })
+    }
+
+    pub fn follows(self, previous: u32) -> bool {
+        (1..(1 << 31)).contains(&self.sequence.wrapping_sub(previous))
+    }
+}
 
 pub fn fragment(
     cookie: [u8; 8],
@@ -22,21 +57,34 @@ pub fn fragment(
     packet[..8].copy_from_slice(&cookie);
     packet[8..12].copy_from_slice(&sequence.to_be_bytes());
     packet[12..16].copy_from_slice(&(data.len() as u32).to_be_bytes());
-    for (group, block) in data.chunks(FRAGMENT * GROUP).enumerate() {
-        let mut parity = [0_u8; FRAGMENT];
-        for (index, part) in block.chunks(FRAGMENT).enumerate() {
-            packet[16..18].copy_from_slice(&((group * GROUP + index) as u16).to_be_bytes());
-            packet[18] = 0;
-            packet[HEADER..HEADER + part.len()].copy_from_slice(part);
-            for (target, byte) in parity.iter_mut().zip(part) {
-                *target ^= *byte;
+    let count = data.len().div_ceil(FRAGMENT);
+    let groups = count.div_ceil(GROUP);
+    for first in (0..groups).step_by(INTERLEAVE_GROUPS) {
+        let striped = (groups - first).min(INTERLEAVE_GROUPS);
+        let mut parity = [[0_u8; FRAGMENT]; INTERLEAVE_GROUPS];
+        for offset in 0..GROUP {
+            for (group, check) in parity.iter_mut().enumerate().take(striped) {
+                let index = (first + group) * GROUP + offset;
+                if index >= count {
+                    continue;
+                }
+                let start = index * FRAGMENT;
+                let part = &data[start..(start + FRAGMENT).min(data.len())];
+                packet[16..18].copy_from_slice(&(index as u16).to_be_bytes());
+                packet[18] = 0;
+                packet[HEADER..HEADER + part.len()].copy_from_slice(part);
+                for (target, byte) in check.iter_mut().zip(part) {
+                    *target ^= *byte;
+                }
+                output(&packet[..HEADER + part.len()])?;
             }
-            output(&packet[..HEADER + part.len()])?;
         }
-        packet[16..18].copy_from_slice(&(group as u16).to_be_bytes());
-        packet[18] = 1;
-        packet[HEADER..].copy_from_slice(&parity);
-        output(&packet)?;
+        for (group, check) in parity.iter().enumerate().take(striped) {
+            packet[16..18].copy_from_slice(&((first + group) as u16).to_be_bytes());
+            packet[18] = 1;
+            packet[HEADER..].copy_from_slice(check);
+            output(&packet)?;
+        }
     }
     Ok(())
 }
@@ -206,13 +254,40 @@ mod tests {
         let original: Vec<_> = (0..20501).map(|x| (x * 19 % 251) as u8).collect();
         let mut receiver = Assembler::new(*b"testcook", Duration::from_millis(42));
         let now = Instant::now();
-        for (index, packet) in packets(0, &original).iter().enumerate().rev() {
-            if index % 9 != 1 {
+        for packet in packets(0, &original).iter().rev() {
+            let piece = u16::from_be_bytes([packet[16], packet[17]]) as usize;
+            if packet[18] != 0 || piece % GROUP != 1 {
                 receiver.packet(packet, now);
             }
         }
         assert_eq!(receiver.ready(now).unwrap().data, original);
         assert!(receiver.ready(now).is_none());
+    }
+
+    #[test]
+    fn interleave_recovers_a_burst_and_axes_reject_older_snapshots() {
+        let original = vec![51; GROUP * FRAGMENT * INTERLEAVE_GROUPS];
+        let now = Instant::now();
+        let mut receiver = Assembler::new(*b"testcook", Duration::from_millis(42));
+        for (i, packet) in packets(0, &original).iter().enumerate() {
+            if !(4..8).contains(&i) {
+                receiver.packet(packet, now);
+            }
+        }
+        assert_eq!(receiver.ready(now).unwrap().data, original);
+        let state = Axes {
+            sequence: 15,
+            x: 3210,
+            y: -4567,
+        };
+        assert_eq!(
+            Axes::parse(&state.packet(*b"testcook"), *b"testcook"),
+            Some(state)
+        );
+        assert_eq!(Axes::parse(&state.packet(*b"testcook"), *b"badcook!"), None);
+        assert!(state.follows(14));
+        assert!(!state.follows(15));
+        assert!(!state.follows(16));
     }
 
     #[test]

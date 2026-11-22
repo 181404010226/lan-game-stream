@@ -8,6 +8,26 @@ pub struct Gamepad {
 }
 
 impl Gamepad {
+    pub fn axes(&mut self, x: i16, y: i16, foreground: bool) -> Result<()> {
+        let state = if foreground {
+            PadState { x, y, ..self.last }
+        } else {
+            PadState::default()
+        };
+        self.update(state)
+    }
+
+    pub fn buttons(&mut self, buttons: u16, foreground: bool) -> Result<()> {
+        let state = if foreground {
+            PadState {
+                buttons: buttons & stream_wire::STANDARD_PAD_BUTTONS,
+                ..self.last
+            }
+        } else {
+            PadState::default()
+        };
+        self.update(state)
+    }
     pub fn connect() -> Result<Self> {
         let driver = Client::connect().context("电脑无法连接 ViGEmBus 虚拟手柄驱动")?;
         let mut target = Xbox360Wired::new(driver, TargetId::XBOX360_WIRED);

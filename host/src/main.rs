@@ -2,6 +2,7 @@ mod audio;
 mod content;
 mod fast_video;
 mod gamepad;
+mod gpu_video;
 mod input;
 mod network;
 mod rtp;
@@ -17,11 +18,12 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use stream_wire::PAD_BUTTONS;
 use stream_wire::{
     AUTH, CHALLENGE, CONTENT, ContentInsets, ERROR, GAMEPAD, Hello, INFO, KEEPALIVE, KEYS,
     MAX_CONTROL, PING, POINTER, PONG, PORT, PadState, Secret, StreamInfo, VIDEO, discovery_game,
@@ -283,38 +285,19 @@ fn session(
     if _resize.is_some() {
         thread::sleep(Duration::from_millis(300));
     }
-    let capture = match Capture::start(&target, hello.content_updates, fps) {
-        Ok(capture) => capture,
+    let started = match start_video(&target, encoder, quality, fps, hello.content_updates) {
+        Ok(started) => started,
         Err(error) => {
             send(&mut socket, ERROR, error.to_string().as_bytes())?;
             return Err(error);
         }
     };
-    let first = match capture.slot.first() {
-        Ok(frame) => frame,
-        Err(error) => {
-            send(&mut socket, ERROR, error.to_string().as_bytes())?;
-            return Err(error);
-        }
-    };
-    let (width, height) = video::output_size(first.width, first.height, quality);
-    let local_rtp = if low_latency {
-        rtp::RtpVideo::bind().ok()
-    } else {
-        None
-    };
-    let endpoint = local_rtp
-        .as_ref()
-        .map(rtp::RtpVideo::endpoint)
-        .transpose()?;
-    let mut child = match encoder.start(&first, width, height, quality, fps, endpoint.as_deref()) {
-        Ok(child) => child,
-        Err(error) => {
-            send(&mut socket, ERROR, error.to_string().as_bytes())?;
-            return Err(error);
-        }
-    };
+    let (width, height) = started.size;
     let desired = f64::from(hello.viewport.0) / f64::from(hello.viewport.1);
+    let axes = lane
+        .as_ref()
+        .filter(|_| pad.is_some())
+        .and_then(|udp| udp.input().ok());
     let active = f64::from(width) / f64::from(height);
     let info = StreamInfo {
         game_id: target.game_id.clone(),
@@ -322,46 +305,107 @@ fn session(
         width,
         height,
         fps,
-        encoder: encoder.name().into(),
+        encoder: started.encoder.into(),
         phone_aspect: desired.is_finite() && (active / desired - 1.0).abs() < 0.02,
         udp_video: lane.is_some(),
         low_latency,
+        udp_axes: axes.is_some(),
     };
-    let result = stream(
+    stream(
         &socket,
         &target,
-        &capture,
-        &first,
-        &mut child,
+        started.capture,
         &info,
         StreamFeatures {
             content_updates: hello.content_updates,
             compact_audio: hello.fast_video,
             lane,
-            local_rtp,
+            axes,
             pad,
         },
         host_stop,
-    );
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    )
+}
+
+struct StartedVideo {
+    size: (u32, u32),
+    encoder: &'static str,
+    capture: VideoCapture,
+}
+
+enum VideoCapture {
+    Gpu(gpu_video::GpuVideo),
+    Ffmpeg {
+        capture: Capture,
+        first: Arc<video::Pixels>,
+        child: Option<std::process::Child>,
+        rtp: Option<rtp::RtpVideo>,
+    },
+}
+
+impl VideoCapture {
+    fn content(&self) -> ContentInsets {
+        match self {
+            Self::Gpu(gpu) => gpu.content(),
+            Self::Ffmpeg { capture, .. } => capture.slot.content(),
+        }
+    }
+}
+
+fn start_video(
+    target: &Target,
+    encoder: &Encoder,
+    quality: Quality,
+    fps: u32,
+    bars: bool,
+) -> Result<StartedVideo> {
+    if quality.low_latency() && encoder.name() == "h264_nvenc" {
+        match gpu_video::GpuVideo::open(target, fps, quality, bars) {
+            Ok(gpu) => {
+                println!("D3D11 纹理直送 NVENC · {}", gpu.adapter);
+                return Ok(StartedVideo {
+                    size: gpu.size,
+                    encoder: gpu_video::GpuVideo::ENCODER,
+                    capture: VideoCapture::Gpu(gpu),
+                });
+            }
+            Err(error) => eprintln!("D3D11 直送暂不可用，使用 FFmpeg：{error:#}"),
+        }
+    }
+    let capture = Capture::start(target, bars, fps)?;
+    let first = capture.slot.first()?;
+    let size = video::output_size(first.width, first.height, quality);
+    let rtp = if quality.low_latency() {
+        rtp::RtpVideo::bind().ok()
+    } else {
+        None
+    };
+    let endpoint = rtp.as_ref().map(rtp::RtpVideo::endpoint).transpose()?;
+    let child = encoder.start(&first, size.0, size.1, quality, fps, endpoint.as_deref())?;
+    Ok(StartedVideo {
+        size,
+        encoder: encoder.name(),
+        capture: VideoCapture::Ffmpeg {
+            capture,
+            first,
+            child: Some(child),
+            rtp,
+        },
+    })
 }
 
 struct StreamFeatures {
     content_updates: bool,
     compact_audio: bool,
     lane: Option<fast_video::FastVideo>,
-    local_rtp: Option<rtp::RtpVideo>,
+    axes: Option<fast_video::FastInput>,
     pad: Option<Gamepad>,
 }
 
 fn stream(
     socket: &TcpStream,
     target: &Target,
-    capture: &Capture,
-    first: &video::Pixels,
-    child: &mut std::process::Child,
+    mut capture: VideoCapture,
     info: &StreamInfo,
     features: StreamFeatures,
     host_stop: &AtomicBool,
@@ -381,30 +425,40 @@ fn stream(
         },
         if info.udp_video { "UDP/FEC" } else { "TCP" }
     );
-    let stdin = child.stdin.take().context("编码器没有输入流")?;
-    let stdout = child.stdout.take();
+    let (mut child, local_rtp) = match &mut capture {
+        VideoCapture::Ffmpeg { child, rtp, .. } => (child.take(), rtp.take()),
+        VideoCapture::Gpu(_) => (None, None),
+    };
+    let stdin = child.as_mut().and_then(|encoder| encoder.stdin.take());
+    let stdout = child.as_mut().and_then(|encoder| encoder.stdout.take());
     let stop = AtomicBool::new(false);
     let encoded_frames = AtomicU32::new(0);
     let StreamFeatures {
         content_updates,
         compact_audio,
         lane,
-        local_rtp,
+        axes,
         pad,
     } = features;
     let (tx, rx) = sync_channel::<(u8, Vec<u8>)>(12);
     thread::scope(|group| {
         let stop_ref = &stop;
         let acknowledgement = tx.clone();
+        let pad = pad.map(|pad| Arc::new(Mutex::new(pad)));
+        if let (Some(axes), Some(input)) = (axes, pad.clone()) {
+            group.spawn(move || axes.receive(target, &input, stop_ref));
+        }
         group.spawn(move || read_controls(socket, target, pad, stop_ref, acknowledgement));
         let status = tx.clone();
-        group.spawn(move || {
-            if let Err(error) = video::feed(stdin, &capture.slot, first, stop_ref, info.fps)
-                && !stop_ref.load(Ordering::Relaxed)
-            {
-                let _ = status.try_send((ERROR, error.to_string().into_bytes()));
-            }
-        });
+        if let (VideoCapture::Ffmpeg { capture, first, .. }, Some(stdin)) = (&capture, stdin) {
+            group.spawn(move || {
+                if let Err(error) = video::feed(stdin, &capture.slot, first, stop_ref, info.fps)
+                    && !stop_ref.load(Ordering::Relaxed)
+                {
+                    let _ = status.try_send((ERROR, error.to_string().into_bytes()));
+                }
+            });
+        }
         let audio_sender = tx.clone();
         group.spawn(|| {
             if let Err(error) = audio::capture(target.pid, &stop, audio_sender, compact_audio) {
@@ -412,23 +466,27 @@ fn stream(
             }
         });
         let count = &encoded_frames;
+        let capture_source = &capture;
         group.spawn(move || {
-            let emit = |encoded: Vec<u8>| {
+            let emit = |index: Option<u32>, encoded: Vec<u8>| {
                 if stop_ref.load(Ordering::Relaxed) {
                     bail!("会话已结束");
                 }
                 let sequence = count.fetch_add(1, Ordering::Relaxed);
                 if let Some(lane) = &lane {
-                    lane.picture(sequence, &encoded)?;
+                    lane.picture(index.unwrap_or(sequence), &encoded)?;
                 } else {
                     tx.send((VIDEO, encoded))
                         .map_err(|_| anyhow!("会话已结束"))?;
                 }
                 Ok(())
             };
-            let result = match (local_rtp, stdout) {
-                (Some(rtp), _) => rtp.access_units(stop_ref, emit),
-                (None, Some(stdout)) => video::access_units(stdout, emit),
+            let result = match (capture_source, local_rtp, stdout) {
+                (VideoCapture::Gpu(gpu), _, _) => {
+                    gpu.pump(stop_ref, |frame| emit(Some(frame.index), frame.bytes))
+                }
+                (_, Some(rtp), _) => rtp.access_units(stop_ref, |frame| emit(None, frame)),
+                (_, None, Some(stdout)) => video::access_units(stdout, |frame| emit(None, frame)),
                 _ => Err(anyhow!("编码器没有输出流")),
             };
             if !stop_ref.load(Ordering::Relaxed) {
@@ -448,7 +506,9 @@ fn stream(
             if stop.load(Ordering::Relaxed) || host_stop.load(Ordering::Relaxed) {
                 break Ok(());
             }
-            if !target.exists() || capture.ended() {
+            if !target.exists()
+                || matches!(&capture, VideoCapture::Ffmpeg { capture, .. } if capture.ended())
+            {
                 break send(&mut output, ERROR, "游戏窗口已关闭".as_bytes());
             }
             let count = encoded_frames.load(Ordering::Relaxed);
@@ -467,7 +527,7 @@ fn stream(
             }
             if content_updates && last_update.elapsed() >= Duration::from_millis(100) {
                 last_update = Instant::now();
-                let measured = capture.slot.content();
+                let measured = capture.content();
                 if measured != content {
                     content = measured;
                     if let Err(error) = send(&mut output, CONTENT, &content.encode()) {
@@ -494,7 +554,13 @@ fn stream(
         stop.store(true, Ordering::Relaxed);
         let _ = socket.shutdown(Shutdown::Both);
         drop(rx);
-        let _ = child.kill();
+        if let VideoCapture::Gpu(gpu) = &capture {
+            gpu.stop();
+        }
+        if let Some(process) = &mut child {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
         println!("手机已断开");
         result.context("连接已结束")
     })
@@ -503,7 +569,7 @@ fn stream(
 fn read_controls(
     socket: &TcpStream,
     target: &Target,
-    mut pad: Option<Gamepad>,
+    pad: Option<Arc<Mutex<Gamepad>>>,
     stop: &AtomicBool,
     acknowledgement: SyncSender<(u8, Vec<u8>)>,
 ) {
@@ -517,15 +583,25 @@ fn read_controls(
             Ok(PING) if buffer.len() == 9 => {
                 let _ = acknowledgement.try_send((PONG, buffer[1..].to_vec()));
             }
-            Ok(GAMEPAD) => {
-                if let (Some(controller), Some(state)) = (&mut pad, PadState::decode(&buffer[1..]))
+            Ok(PAD_BUTTONS) if buffer.len() == 3 => {
+                if let Some(pad) = &pad
+                    && let Err(error) = pad.lock().unwrap().buttons(
+                        u16::from_be_bytes([buffer[1], buffer[2]]),
+                        target.foreground(),
+                    )
                 {
+                    eprintln!("{error:#}");
+                    break;
+                }
+            }
+            Ok(GAMEPAD) => {
+                if let (Some(controller), Some(state)) = (&pad, PadState::decode(&buffer[1..])) {
                     let state = if target.foreground() {
                         state
                     } else {
                         PadState::default()
                     };
-                    if let Err(error) = controller.update(state) {
+                    if let Err(error) = controller.lock().unwrap().update(state) {
                         eprintln!("{error:#}");
                         break;
                     }

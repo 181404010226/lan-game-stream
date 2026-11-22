@@ -1,6 +1,10 @@
+use crate::gamepad::Gamepad;
+use crate::window::Target;
 use socket2::Socket;
 use std::io::{self, ErrorKind};
 use std::net::{TcpStream, UdpSocket};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use stream_wire::{UDP_OFFER, UDP_READY, nonce, receive, send, udp};
 
@@ -46,6 +50,14 @@ mod tests {
 }
 
 impl FastVideo {
+    pub fn input(&self) -> io::Result<FastInput> {
+        let socket = self.socket.try_clone()?;
+        socket.set_read_timeout(Some(Duration::from_millis(20)))?;
+        Ok(FastInput {
+            socket,
+            cookie: self.cookie,
+        })
+    }
     pub fn negotiate(tcp: &mut TcpStream) -> io::Result<Option<Self>> {
         let cookie: [u8; 8] = nonce()?[..8].try_into().unwrap();
         let local_ip = tcp.local_addr()?.ip();
@@ -108,5 +120,52 @@ impl FastVideo {
                 Err(error)
             }
         })
+    }
+}
+
+pub struct FastInput {
+    socket: UdpSocket,
+    cookie: [u8; 8],
+}
+
+impl FastInput {
+    pub fn receive(&self, target: &Target, pad: &Mutex<Gamepad>, stop: &AtomicBool) {
+        let mut buffer = [0; 64];
+        let mut last = None;
+        let mut updated = None;
+        while !stop.load(Ordering::Relaxed) {
+            match self.socket.recv(&mut buffer) {
+                Ok(count) => {
+                    if let Some(axes) = udp::Axes::parse(&buffer[..count], self.cookie)
+                        && last.is_none_or(|previous| axes.follows(previous))
+                    {
+                        if last.is_none() {
+                            println!("Xbox 摇杆已启用 UDP 最新状态");
+                        }
+                        last = Some(axes.sequence);
+                        updated = Some(Instant::now());
+                        if let Err(error) =
+                            pad.lock()
+                                .unwrap()
+                                .axes(axes.x, axes.y, target.foreground())
+                        {
+                            eprintln!("{error:#}");
+                            break;
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => break,
+            }
+            if updated.is_some_and(|time| time.elapsed() > Duration::from_millis(130)) {
+                updated = None;
+                let _ = pad.lock().unwrap().axes(0, 0, target.foreground());
+            }
+        }
+        let _ = pad.lock().unwrap().axes(0, 0, target.foreground());
     }
 }

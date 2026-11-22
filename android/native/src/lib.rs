@@ -29,6 +29,7 @@ struct Client {
     info: String,
     datagrams: Option<Mutex<Datagrams>>,
     active: AtomicBool,
+    axes: Option<axes::AxesSender>,
 }
 
 impl Client {
@@ -120,6 +121,16 @@ impl Client {
                 }
             }
         });
+        let axes = serde_json::from_str::<stream_wire::StreamInfo>(&info)
+            .ok()
+            .filter(|info| info.udp_axes)
+            .and_then(|_| datagrams.as_ref())
+            .and_then(|lane| {
+                lane.socket
+                    .try_clone()
+                    .ok()
+                    .and_then(|socket| axes::AxesSender::new(socket, lane.cookie).ok())
+            });
         Ok(Self {
             reader: Mutex::new(reader),
             control,
@@ -127,6 +138,7 @@ impl Client {
             info,
             datagrams: datagrams.map(Mutex::new),
             active: AtomicBool::new(true),
+            axes,
         })
     }
 
@@ -141,6 +153,7 @@ impl Client {
 
 struct Datagrams {
     socket: UdpSocket,
+    cookie: [u8; 8],
     video: stream_wire::udp::Assembler,
     last_picture: Option<Instant>,
 }
@@ -171,6 +184,7 @@ impl Datagrams {
             .ok()?;
         Some(Self {
             socket,
+            cookie,
             video: stream_wire::udp::Assembler::new(cookie, Duration::from_millis(42)),
             last_picture: None,
         })
@@ -450,6 +464,9 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_close(
     let connection = clients().lock().unwrap().remove(&id);
     if let Some(connection) = connection {
         connection.active.store(false, Ordering::Relaxed);
+        if let Some(axes) = &connection.axes {
+            axes.stop();
+        }
         let _ = connection.control.shutdown(Shutdown::Both);
     }
 }
@@ -469,5 +486,15 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_gamepad(
         x: x.clamp(-32767, 32767) as i16,
         y: y.clamp(-32767, 32767) as i16,
     };
-    client.queue(GAMEPAD, report.encode().to_vec());
+    if let Some(axes) = &client.axes {
+        if axes.record(report) {
+            client.queue(
+                stream_wire::PAD_BUTTONS,
+                report.buttons.to_be_bytes().to_vec(),
+            );
+        }
+    } else {
+        client.queue(GAMEPAD, report.encode().to_vec());
+    }
 }
+mod axes;
