@@ -2,6 +2,7 @@ mod audio;
 mod color_gpu;
 mod content;
 mod fast_video;
+mod game_texture;
 mod gamepad;
 mod gpu_video;
 mod input;
@@ -11,6 +12,7 @@ mod video;
 mod window;
 
 use anyhow::{Context, Result, anyhow, bail};
+use game_texture::CaptureMode;
 use gamepad::Gamepad;
 use input::GameInput;
 use network::Interface;
@@ -45,6 +47,7 @@ struct Options {
     port: u16,
     list: bool,
     quality: Quality,
+    capture: CaptureMode,
 }
 
 fn options() -> Result<Option<Options>> {
@@ -54,6 +57,7 @@ fn options() -> Result<Option<Options>> {
         port: PORT,
         list: false,
         quality: Quality::Auto,
+        capture: CaptureMode::Window,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -63,9 +67,10 @@ fn options() -> Result<Option<Options>> {
             "--bind" => result.bind = Some(args.next().context("--bind 缺少 IPv4 地址")?.parse()?),
             "--port" => result.port = args.next().context("--port 缺少端口")?.parse()?,
             "--quality" => result.quality = args.next().context("--quality 缺少设置")?.parse()?,
+            "--capture" => result.capture = args.next().context("--capture 缺少设置")?.parse()?,
             "--help" | "-h" => {
                 println!(
-                    "局域网游戏串流主机\n\nlan-stream-host.exe [--config 游戏配置路径] [--bind 局域网 IPv4] [--port 24865] [--quality auto|smooth|balanced|sharp|latency|native]\nlan-stream-host.exe --list"
+                    "局域网游戏串流主机\n\nlan-stream-host.exe [--config 游戏配置路径] [--bind 局域网 IPv4] [--port 24865] [--quality auto|smooth|balanced|sharp|latency|native] [--capture window|auto|game|game-copy]\nlan-stream-host.exe --list"
                 );
                 return Ok(None);
             }
@@ -179,9 +184,15 @@ fn run() -> Result<()> {
                 if !matches!(peer.ip(), IpAddr::V4(ip) if interface.contains(ip)) {
                     continue;
                 }
-                if let Err(error) =
-                    session(stream, &games, &encoder, opts.quality, &mut gamepad, &stop)
-                {
+                if let Err(error) = session(
+                    stream,
+                    &games,
+                    &encoder,
+                    opts.quality,
+                    opts.capture,
+                    &mut gamepad,
+                    &stop,
+                ) {
                     eprintln!("会话结束：{error:#}");
                 }
             }
@@ -233,6 +244,7 @@ fn session(
     games: &HashMap<String, Game>,
     encoder: &Encoder,
     quality: Quality,
+    capture_mode: CaptureMode,
     gamepad: &mut Option<Arc<Mutex<Gamepad>>>,
     host_stop: &AtomicBool,
 ) -> Result<()> {
@@ -308,14 +320,18 @@ fn session(
     } else {
         video::FPS
     };
-    let _resize = WindowResize::apply(
-        &target,
-        native_window.unwrap_or(hello.viewport),
-        native_window.map_or(if low_latency { 1600 } else { 1920 }, |size| {
-            i32::from(size.0)
-        }),
-        native_window.is_some(),
-    );
+    let _resize = if capture_mode.required() {
+        None
+    } else {
+        WindowResize::apply(
+            &target,
+            native_window.unwrap_or(hello.viewport),
+            native_window.map_or(if low_latency { 1600 } else { 1920 }, |size| {
+                i32::from(size.0)
+            }),
+            native_window.is_some(),
+        )
+    };
     if _resize.is_some() {
         thread::sleep(Duration::from_millis(300));
     }
@@ -329,7 +345,16 @@ fn session(
             })
         });
     let detect_bars = hello.content_updates && !locked_aspect;
-    let started = match start_video(&target, encoder, quality, fps, detect_bars) {
+    let requested_size = native_window.map(|(w, h)| (u32::from(w), u32::from(h)));
+    let started = match start_video(
+        &target,
+        encoder,
+        quality,
+        fps,
+        detect_bars,
+        capture_mode,
+        requested_size,
+    ) {
         Ok(started) => started,
         Err(error) => {
             send(&mut socket, ERROR, error.to_string().as_bytes())?;
@@ -417,18 +442,29 @@ fn start_video(
     quality: Quality,
     fps: u32,
     bars: bool,
+    mode: CaptureMode,
+    requested_size: Option<(u32, u32)>,
 ) -> Result<StartedVideo> {
+    if mode.required()
+        && (!quality.low_latency() || requested_size.is_none() || encoder.name() != "h264_nvenc")
+    {
+        bail!("游戏内取帧需要原生像素档、UDP 和 NVIDIA NVENC");
+    }
     if quality.low_latency() && encoder.name() == "h264_nvenc" {
-        match gpu_video::GpuVideo::open(target, fps, quality, bars) {
+        match gpu_video::GpuVideo::open(target, fps, quality, bars, mode, requested_size) {
             Ok(gpu) => {
-                println!("D3D11 纹理直送 NVENC · {}", gpu.adapter);
+                println!(
+                    "D3D11 纹理直送 NVENC · {} · {}",
+                    gpu.adapter, gpu.encoder_name
+                );
                 return Ok(StartedVideo {
                     size: gpu.size,
                     fps,
-                    encoder: gpu_video::GpuVideo::ENCODER,
+                    encoder: gpu.encoder_name,
                     capture: VideoCapture::Gpu(gpu),
                 });
             }
+            Err(error) if mode.required() => return Err(error),
             Err(error) => eprintln!("D3D11 直送暂不可用，使用 FFmpeg：{error:#}"),
         }
     }

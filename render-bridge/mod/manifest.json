@@ -1,0 +1,9 @@
+{
+  "name": "Offscreen",
+  "namespace": "LanStream",
+  "version_number": "0.4.6",
+  "description": "Cooperative mono render target for the LAN streaming host.",
+  "website_url": "https://github.com/181404010226/lan-game-stream",
+  "dependencies": [],
+  "extra": { "godot": { "authors": ["LanStream"], "optional_dependencies": [], "compatible_mod_loader_version": ["6.2.0", "6.3.0"], "compatible_game_version": [] } }
+}

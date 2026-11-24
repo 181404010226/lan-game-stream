@@ -385,7 +385,9 @@ public final class MainActivity extends Activity {
 
     private void showMenu() {
         overlay.reset();
-        String details = stream.width + " × " + stream.height + "  ·  " + profile.mode.label;
+        String source = "nvenc-game-direct".equals(stream.encoder) ? "游戏内直读"
+            : "nvenc-game-copy".equals(stream.encoder) ? "游戏内复制" : "窗口取帧";
+        String details = stream.width + " × " + stream.height + "  ·  " + profile.mode.label + "  ·  " + source;
         String[] items = {"画面适配   " + details, "编辑触控布局", controlsVisible ? "隐藏触控键" : "显示触控键",
             profile.touchMouse ? "关闭点画面操作鼠标" : "开启点画面操作鼠标", muted ? "打开游戏声音" : "静音", "退出串流"};
         new AlertDialog.Builder(this).setTitle(stream.title).setItems(items, (dialog, index) -> {

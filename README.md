@@ -2,13 +2,15 @@
 
 用 Android 手机玩 Windows 电脑上的游戏。主机发送对应的游戏窗口和声音，手机回传 Xbox 手柄或键鼠操作。
 
+新增游戏、引擎插件或显卡编码后端时，可先查看当前取帧路径、回退条件和代码入口。[模块架构图与扩展指南](docs/architecture.md)
+
 ## 连接
 
 1. 让电脑与手机连接同一个局域网。把 `lan-stream-host.exe` 和 `lan-stream-games.json` 放在同一目录，双击启动电脑主机。
 2. 在电脑打开对应游戏并保持窗口在前台。窗口化和无边框窗口适合采集。
 3. 手机上打开游戏专用 APK。App 会自动在局域网发现已配对的主机并进入对应游戏。连接中断时会重试。
 
-Windows 端通过 Windows Graphics Capture 取画，依赖当前电脑 PATH 中的 FFmpeg 编码 H.264。可把完整的 `ffmpeg.exe` 路径设到 `LAN_STREAM_FFMPEG`。主机会探测 NVIDIA 和 AMD 硬件编码，必要时使用 `libx264`。
+Windows 主机默认通过 Windows Graphics Capture 取画，也支持从 Godot 插件读取游戏纹理。启动时会用 FFmpeg 试编码，依次探测 NVIDIA NVENC、AMD AMF 和 `libx264`。将 `ffmpeg.exe` 加入 PATH，或用 `LAN_STREAM_FFMPEG` 指定其完整路径。
 
 ## 串流质量和延迟
 
@@ -17,6 +19,16 @@ Windows 端通过 Windows Graphics Capture 取画，依赖当前电脑 PATH 中�
 - `--quality latency` 优先在 NVIDIA 适配器上采集 D3D11 纹理。GPU 裁出游戏窗口，将 BGRA 转为 BT.709 有限范围 NV12，再直接提交 NVENC。黑边检测只取样少量行列。显卡或驱动不支持这条路径时，由 FFmpeg 接力。Android 使用 SurfaceView 即时提交最新帧。游戏显示器达到 120 Hz 时，该档位以 120 fps 为目标，手机会请求匹配的刷新率。UDP 无法稳定启用时切回低码率 60 fps。
 - `--quality auto` 会在 UDP 启用时选择 `balanced`，在 TCP 下选择 `smooth`。`smooth`、`balanced` 和 `sharp` 也可以手动选。画质档位只调整编码尺寸和码率，显示仍按游戏比例适配。
 - `--quality native` 在新版 APK 连接时，根据手机尺寸和游戏画幅调整窗口并输出原生像素。固定比例的游戏可以通过 `-NativeAspect '16:9'` 指定内容比例。例如 2800×1260 的手机显示 2240×1260 的 16:9 内容，两侧可放触控。该档位在 NVIDIA 直送路径用 18 Mb/s 和空间自适应量化保留细节。旧 APK 自动选择低延迟档，窗口尺寸仍受电脑可用空间和游戏设置限制。
+
+从 v0.4.5 开始，D3D11 直送路径优先使用 NVENC 完成事件。主机会轮换四组 NV12 纹理和码流缓冲，最多同时提交两帧，让下一帧的采集和色彩转换与上一帧的编码重叠。主机窗口会显示实际采用的异步或同步模式。已有 v0.4.4 手机客户端可以直接连接新版主机。
+
+### Godot 游戏内取帧（v0.4.6 体验版）
+
+Windows x64 游戏可通过 Godot 3 的 GDNative 单视口接口，把场景渲染到手机画幅的离屏纹理。Godot 插件在呈现之前分流，同一帧也会按比例显示在电脑窗口。主机从三张带 DXGI 键控互斥量的共享 BGRA 纹理中取最新画面，再用原有的 BT.709 转色和异步 NVENC 编码。OpenGL 直接写入共享纹理时显示「游戏内直读」。Godot 3 的二维 Canvas 经常写入自己的帧缓冲，插件核对实际颜色附件后会使用一次 GPU 中转复制，手机菜单显示「游戏内复制」。
+
+使用 `render-bridge/build-adapter.ps1` 构建插件，需要 CMake 与 Visual Studio x64 C++ 工具链。首次构建会下载固定版本的 Godot 3.6.1 C 接口头文件并校验 SHA-256，也可通过 `-GodotHeaders` 指定本地头文件目录。在游戏退出后，把产物 `LanStreamRenderer.dll` 放在游戏 EXE 旁，把 `mods/LanStream-Offscreen.zip` 放在游戏的 `mods` 目录。此适配入口面向安装 Godot Mod Loader 的游戏，兼容性取决于其引擎和渲染后端。
+
+主机默认使用 `--capture window`。用 `--quality native --capture game` 开启实验路径，缺少游戏插件时主机会给出提示。`--capture game-copy` 用于对照中转复制；`--capture auto` 在启动时尝试游戏纹理，并可降级到窗口采集。手机右上角串流菜单显示当前路径，日志中的 `p95-gap-us` 表示解码器渲染回调或显示表面更新间隔的第 95 百分位，单位为微秒。
 
 ## 触控和画幅
 

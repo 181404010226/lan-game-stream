@@ -43,6 +43,8 @@ final class MediaRunner {
     private long resyncSince;
     private long displayStart, lastDisplay;
     private int displayed, longGaps;
+    private final long[] displayIntervals = new long[1024];
+    private int intervalCount;
     private long receiveStart, missingFrames;
     private int receivedFrames, queueDrops;
 
@@ -177,13 +179,21 @@ final class MediaRunner {
     void displayedFrame(long now) {
         if (now <= lastDisplay) return;
         if (displayStart == 0) displayStart = now;
-        if (lastDisplay != 0 && now - lastDisplay > 1_500_000_000L / fps) longGaps++;
+        if (lastDisplay != 0) {
+            long interval = now - lastDisplay;
+            if (interval > 1_500_000_000L / fps) longGaps++;
+            if (intervalCount < displayIntervals.length) displayIntervals[intervalCount++] = interval;
+        }
         lastDisplay = now;
         displayed++;
         if (now - displayStart >= 5_000_000_000L) {
-            Log.i("LanStream", "Display fps " + Math.round(displayed * 1_000_000_000.0 / (now - displayStart)) + " gaps=" + longGaps);
+            Arrays.sort(displayIntervals, 0, intervalCount);
+            long p95Us = intervalCount == 0 ? 0 : displayIntervals[(intervalCount * 95 - 1) / 100] / 1000;
+            Log.i("LanStream", "Display fps " + Math.round(displayed * 1_000_000_000.0 / (now - displayStart))
+                + " gaps=" + longGaps + " p95-gap-us=" + p95Us);
             displayStart = now;
             displayed = longGaps = 0;
+            intervalCount = 0;
         }
     }
 

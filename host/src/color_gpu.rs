@@ -11,16 +11,42 @@ use windows::core::{BOOL, Interface};
 pub struct Nv12Converter {
     context: ID3D11VideoContext1,
     processor: ID3D11VideoProcessor,
-    input: ID3D11VideoProcessorInputView,
+    inputs: Vec<ID3D11VideoProcessorInputView>,
+    outputs: Vec<Nv12Output>,
+}
+
+struct Nv12Output {
     target: ID3D11VideoProcessorOutputView,
     texture: ID3D11Texture2D,
 }
 
+// NVENC recommends at least four registered input/output pairs with no B-frames.
+pub const NVENC_SURFACES: usize = 4;
+
 impl Nv12Converter {
+    #[cfg(test)]
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         rgb: &ID3D11Texture2D,
+        source: (u32, u32),
+        destination: (u32, u32),
+        fps: u32,
+    ) -> Result<Self> {
+        Self::from_inputs(
+            device,
+            context,
+            std::slice::from_ref(rgb),
+            source,
+            destination,
+            fps,
+        )
+    }
+
+    pub fn from_inputs(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        rgb: &[ID3D11Texture2D],
         source: (u32, u32),
         destination: (u32, u32),
         fps: u32,
@@ -107,18 +133,34 @@ impl Nv12Converter {
             let processor = video
                 .CreateVideoProcessor(&modes, 0)
                 .context("创建 D3D11 视频处理器")?;
-            let mut texture = None;
-            device
-                .CreateTexture2D(&desc, None, Some(&mut texture))
-                .context("创建 NV12 输出纹理")?;
-            let texture = texture.context("没有取得 NV12 纹理")?;
-            let (mut input, mut target) = (None, None);
-            video
-                .CreateVideoProcessorInputView(rgb, &modes, &input_desc, Some(&mut input))
-                .context("绑定 BGRA 输入视图")?;
-            video
-                .CreateVideoProcessorOutputView(&texture, &modes, &output_desc, Some(&mut target))
-                .context("绑定 NV12 输出视图")?;
+            let mut inputs = Vec::with_capacity(rgb.len());
+            for texture in rgb {
+                let mut input = None;
+                video
+                    .CreateVideoProcessorInputView(texture, &modes, &input_desc, Some(&mut input))
+                    .context("绑定 BGRA 输入视图")?;
+                inputs.push(input.context("没有 BGRA 输入视图")?);
+            }
+            let mut outputs = Vec::with_capacity(NVENC_SURFACES);
+            for _ in 0..NVENC_SURFACES {
+                let (mut texture, mut target) = (None, None);
+                device
+                    .CreateTexture2D(&desc, None, Some(&mut texture))
+                    .context("创建 NV12 输出纹理")?;
+                let texture = texture.context("没有取得 NV12 纹理")?;
+                video
+                    .CreateVideoProcessorOutputView(
+                        &texture,
+                        &modes,
+                        &output_desc,
+                        Some(&mut target),
+                    )
+                    .context("绑定 NV12 输出视图")?;
+                outputs.push(Nv12Output {
+                    target: target.context("没有 NV12 输出视图")?,
+                    texture,
+                });
+            }
             context.VideoProcessorSetStreamFrameFormat(
                 &processor,
                 0,
@@ -154,27 +196,30 @@ impl Nv12Converter {
             Ok(Self {
                 context,
                 processor,
-                input: input.context("没有 BGRA 输入视图")?,
-                target: target.context("没有 NV12 输出视图")?,
-                texture,
+                inputs,
+                outputs,
             })
         }
     }
 
-    pub fn texture(&self) -> &ID3D11Texture2D {
-        &self.texture
+    pub fn texture(&self, slot: usize) -> &ID3D11Texture2D {
+        &self.outputs[slot].texture
     }
 
-    pub fn convert(&self) -> Result<()> {
+    pub fn convert(&self, slot: usize) -> Result<()> {
+        self.convert_input(0, slot)
+    }
+
+    pub fn convert_input(&self, input: usize, slot: usize) -> Result<()> {
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: BOOL(1),
-            pInputSurface: ManuallyDrop::new(Some(self.input.clone())),
+            pInputSurface: ManuallyDrop::new(Some(self.inputs[input].clone())),
             ..Default::default()
         };
         let result = unsafe {
             self.context.VideoProcessorBlt(
                 &self.processor,
-                &self.target,
+                &self.outputs[slot].target,
                 0,
                 std::slice::from_ref(&stream),
             )

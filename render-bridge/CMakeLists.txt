@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.20)
+project(LanStreamRenderer LANGUAGES CXX)
+if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "Requires Windows x64")
+endif()
+set(GODOT_HEADERS "" CACHE PATH "Godot 3 GDNative C headers")
+if(NOT EXISTS "${GODOT_HEADERS}/gdnative_api_struct.gen.h")
+  set(headers_revision "10b5e310edb493de6fcd302a6c27baedec880193")
+  set(deps_dir "${CMAKE_CURRENT_BINARY_DIR}/_deps")
+  set(headers_zip "${deps_dir}/godot-headers-${headers_revision}.zip")
+  file(MAKE_DIRECTORY "${deps_dir}")
+  file(DOWNLOAD
+    "https://codeload.github.com/godotengine/godot-headers/zip/${headers_revision}"
+    "${headers_zip}"
+    EXPECTED_HASH SHA256=55b42a273e3c12ef7a1338a4bf5836f2dc718a1fe515c2e078400b99dd236b2a
+    TLS_VERIFY ON TIMEOUT 90)
+  file(ARCHIVE_EXTRACT INPUT "${headers_zip}" DESTINATION "${deps_dir}")
+  set(GODOT_HEADERS "${deps_dir}/godot-headers-${headers_revision}")
+endif()
+if(NOT EXISTS "${GODOT_HEADERS}/gdnative_api_struct.gen.h")
+  message(FATAL_ERROR "Godot 3 GDNative headers missing from GODOT_HEADERS: ${GODOT_HEADERS}")
+endif()
+add_library(LanStreamRenderer SHARED godot_bridge.cpp)
+target_include_directories(LanStreamRenderer PRIVATE "${GODOT_HEADERS}")
+target_compile_features(LanStreamRenderer PRIVATE cxx_std_17)
+target_compile_definitions(LanStreamRenderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(LanStreamRenderer PRIVATE opengl32 d3d11 dxgi)
