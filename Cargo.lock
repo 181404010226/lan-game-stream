@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "lan-stream-android"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "jni",
  "serde_json",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "lan-stream-host"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "cc",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "stream-wire"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "getrandom",
  "hmac",

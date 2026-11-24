@@ -98,6 +98,7 @@ pub struct Assembler {
     cookie: [u8; 8],
     next: u32,
     expiry: Duration,
+    reorder_grace: Duration,
     pending: BTreeMap<u32, Partial>,
 }
 
@@ -107,8 +108,15 @@ impl Assembler {
             cookie,
             next: 0,
             expiry,
+            reorder_grace: expiry,
             pending: BTreeMap::new(),
         }
+    }
+
+    /// A receiver with keyframe feedback can recover a proven hole sooner.
+    /// An incomplete frame alone still gets the full FEC expiry.
+    pub fn set_reorder_grace(&mut self, grace: Duration) {
+        self.reorder_grace = grace.min(self.expiry);
     }
 
     pub fn packet(&mut self, packet: &[u8], now: Instant) {
@@ -152,6 +160,9 @@ impl Assembler {
             index / GROUP
         };
         picture.repair(group);
+        if picture.missing == 0 {
+            picture.completed = Some(now);
+        }
     }
 
     pub fn ready(&mut self, now: Instant) -> Option<Picture> {
@@ -164,7 +175,19 @@ impl Assembler {
                     data: picture.bytes,
                 });
             }
-            if now.saturating_duration_since(first.started) < self.expiry {
+            let later_complete = self.reorder_grace < self.expiry
+                && self
+                    .pending
+                    .range((
+                        std::ops::Bound::Excluded(self.next),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .any(|(_, picture)| {
+                        picture.completed.is_some_and(|at| {
+                            now.saturating_duration_since(at) >= self.reorder_grace
+                        })
+                    });
+            if now.saturating_duration_since(first.started) < self.expiry && !later_complete {
                 return None;
             }
             if sequence > self.next {
@@ -184,6 +207,7 @@ struct Partial {
     parity: Vec<Option<Vec<u8>>>,
     missing: usize,
     started: Instant,
+    completed: Option<Instant>,
 }
 
 impl Partial {
@@ -194,6 +218,7 @@ impl Partial {
             parity: vec![None; count.div_ceil(GROUP)],
             missing: count,
             started,
+            completed: None,
         }
     }
 
@@ -288,6 +313,34 @@ mod tests {
         assert!(state.follows(14));
         assert!(!state.follows(15));
         assert!(!state.follows(16));
+    }
+
+    #[test]
+    fn feedback_grace_starts_only_after_a_later_picture_finishes() {
+        let now = Instant::now();
+        let first = packets(0, &[42; FRAGMENT + 1]);
+        let second = packets(1, b"next");
+        for repaired in [false, true] {
+            let mut receiver = Assembler::new(*b"testcook", Duration::from_millis(42));
+            receiver.set_reorder_grace(Duration::from_millis(8));
+            receiver.packet(&first[0], now);
+            let later = now + Duration::from_millis(19);
+            assert!(receiver.ready(later).is_none());
+            receiver.packet(&second[0], later);
+            let within_grace = later + Duration::from_millis(7);
+            assert!(receiver.ready(within_grace).is_none());
+            if repaired {
+                receiver.packet(first.last().unwrap(), within_grace);
+                assert_eq!(receiver.ready(within_grace).unwrap().sequence, 0);
+            }
+            assert_eq!(
+                receiver
+                    .ready(later + Duration::from_millis(8))
+                    .unwrap()
+                    .sequence,
+                1
+            );
+        }
     }
 
     #[test]

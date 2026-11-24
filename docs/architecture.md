@@ -58,11 +58,11 @@ flowchart TB
     win --> nv12
     shared --> nv12
 
-    media["局域网会话 · wire<br/>H.264 视频经 UDP/FEC 或 TCP"]:::session
+    media["局域网会话 · wire<br/>UDP/FEC 分批发送或 TCP<br/>可靠控制通道 · 按需请求 IDR"]:::session
     phone["Android 游戏客户端<br/>影音播放 · 自定义触控回传"]:::binding
     ff --> media
     qsv -.-> media
-    nv --> media
+    nv <--> media
     media <--> phone
 
     classDef binding fill:#17394c,stroke:#17394c,color:#ffffff,stroke-width:2px;
@@ -105,6 +105,12 @@ flowchart TB
 
 ## 维护与验收
 
+从 v0.4.7 起，原生 NVENC 主机通过 `StreamInfo.keyframe_feedback` 声明按需关键帧能力。UDP 接收端为乱序包和 FEC 保留恢复时间。有更新的完整帧持续等候 8 毫秒时，可跳过缺帧。确认缺帧或解码队列溢出后，手机通过可靠控制连接请求 IDR，继续播放仍能解码的已排队画面，收到 IDR 时切换到新参考帧。旧主机和 FFmpeg 路径使用周期性关键帧。Android 日志记录恢复次数、最长恢复时间和显示回调的最大间隔。[重组](../wire/src/udp.rs) · [编码](../host/src/gpu_video.rs) · [解码](../android/java/dev/lanstream/mobile/MediaRunner.java)
+
+Windows 发送线程为已连接的 UDP 视频套接字申请 qWAVE 音视频优先级，系统不支持时仍可分批发送。Windows 每批最多发送六个数据报，大帧的分批等待预算上限为 6 毫秒。Android 在前台 UDP 串流期间持有低延迟 Wi-Fi 锁，停止串流时释放。解码队列能容纳短时成批到达的视频，积压时可从更新的 IDR 接续。硬件解码器支持的速率高于显示目标时，可以更快清空积压。[UDP 发送](../host/src/fast_video.rs) · [手机会话](../android/java/dev/lanstream/mobile/MainActivity.java)
+
 本页的 Mermaid 代码是架构图的维护入口。增加游戏绑定字段、引擎生产端、编码后端或回退条件时，在同一次改动中更新受影响的节点、选路说明和代码链接。扩展示例实现后，将对应虚线改成实线，并在本节注明实际测试的引擎、显卡和客户端环境。
 
-v0.4.6 已在 Godot 3.6.1 GLES3、Mod Loader 6.3.0 和 RTX 3050 Ti Laptop GPU 的独立场景验证窗口捕获、游戏内直读及中转复制。正式 APK 已在 Android 11 模拟器验证解码与显示。Steam 版《土豆兄弟》的定制 Godot 3.7、真实手机 Wi-Fi 以及其他厂商显卡需分别记录实测结果。比较新路径时保留本机预览，用画面编号统计不同帧的到达间隔，并单独测量渲染完成到编码完成的耗时。
+v0.4.6 已在 Godot 3.6.1 GLES3、Mod Loader 6.3.0 和 RTX 3050 Ti Laptop GPU 的独立场景验证窗口捕获、游戏内直读及中转复制。Android 11 模拟器验证了解码与显示。Steam 版《土豆兄弟》1.2.0.3 的定制 Godot 3.7 在本机通过 Godot autoload 加载同一份适配脚本，vivo V2307A 在 Wi-Fi 下以 2240×1260 收到 `nvenc-game-copy`，Xbox 菜单导航通过。其他引擎和显卡需单独验证。比较流畅度时，记录物理手机 SurfaceFlinger 的实际上屏间隔，并分别报告电脑编码输出和手机恢复关键帧的耗时。
+
+同一台手机以 60 fps 为目标，在同一暂停画面上各采集约 75 秒。v0.4.6 与 v0.4.7 的实际上屏间隔 P99.9 分别为 265.9 和 149.5 毫秒，超过 200 毫秒的间隔分别出现 8 次和 1 次。v0.4.7 另一次游戏窗口在前台的 75 秒采样仍出现 6 次超过 200 毫秒的间隔。游戏负载和无线条件会影响结果。

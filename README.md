@@ -22,11 +22,20 @@ Windows 主机默认通过 Windows Graphics Capture 取画，也支持从 Godot 
 
 从 v0.4.5 开始，D3D11 直送路径优先使用 NVENC 完成事件。主机会轮换四组 NV12 纹理和码流缓冲，最多同时提交两帧，让下一帧的采集和色彩转换与上一帧的编码重叠。主机窗口会显示实际采用的异步或同步模式。已有 v0.4.4 手机客户端可以直接连接新版主机。
 
+v0.4.7 改进了 Wi-Fi 突发丢帧后的恢复。使用新版手机端和原生 NVENC 主机时，手机可以立即请求关键帧。UDP 发送端对数据和校验包一起分批，并向 Windows 请求音视频流量优先级。Android 10 及以上在前台串流时请求低延迟 Wi-Fi。低延迟解码按设备能力预留追帧余量，显示仍采用已协商的帧率。日志中的 `max-receive-gap-us`、`max-recovery-us` 和 `max-gap-us` 分别记录完整帧到达、恢复参考帧和显示回调的尾部耗时。
+
 ### Godot 游戏内取帧（v0.4.6 体验版）
 
 Windows x64 游戏可通过 Godot 3 的 GDNative 单视口接口，把场景渲染到手机画幅的离屏纹理。Godot 插件在呈现之前分流，同一帧也会按比例显示在电脑窗口。主机从三张带 DXGI 键控互斥量的共享 BGRA 纹理中取最新画面，再用原有的 BT.709 转色和异步 NVENC 编码。OpenGL 直接写入共享纹理时显示「游戏内直读」。Godot 3 的二维 Canvas 经常写入自己的帧缓冲，插件核对实际颜色附件后会使用一次 GPU 中转复制，手机菜单显示「游戏内复制」。
 
-使用 `render-bridge/build-adapter.ps1` 构建插件，需要 CMake 与 Visual Studio x64 C++ 工具链。首次构建会下载固定版本的 Godot 3.6.1 C 接口头文件并校验 SHA-256，也可通过 `-GodotHeaders` 指定本地头文件目录。在游戏退出后，把产物 `LanStreamRenderer.dll` 放在游戏 EXE 旁，把 `mods/LanStream-Offscreen.zip` 放在游戏的 `mods` 目录。此适配入口面向安装 Godot Mod Loader 的游戏，兼容性取决于其引擎和渲染后端。
+使用 `render-bridge/build-adapter.ps1` 构建插件，需要 CMake 与 Visual Studio x64 C++ 工具链。首次构建会下载固定版本的 Godot 3.6.1 C 接口头文件并校验 SHA-256，也可通过 `-GodotHeaders` 指定本地头文件目录。退出游戏，把产物 `LanStreamRenderer.dll` 放在游戏 EXE 旁。支持用 Godot Mod Loader 加载本地 ZIP 的游戏，可将 `LanStream-Offscreen.zip` 放入加载器配置的模组目录。
+
+Steam 版《土豆兄弟》1.2.0.3 已实测可通过 Godot 自动加载插件。将仓库中的 `render-bridge/mod/mod_main.gd` 复制到游戏目录的 `LanStream/mod_main.gd`。在 `Brotato.exe` 旁创建或编辑 `override.cfg`，将示例路径改为脚本的实际绝对路径。已有 `[autoload]` 节时，直接在该节内追加 `LanStreamOffscreen` 一行。每个游戏使用一种加载方式。
+
+```ini
+[autoload]
+LanStreamOffscreen="D:/SteamLibrary/steamapps/common/Brotato/LanStream/mod_main.gd"
+```
 
 主机默认使用 `--capture window`。用 `--quality native --capture game` 开启实验路径，缺少游戏插件时主机会给出提示。`--capture game-copy` 用于对照中转复制；`--capture auto` 在启动时尝试游戏纹理，并可降级到窗口采集。手机右上角串流菜单显示当前路径，日志中的 `p95-gap-us` 表示解码器渲染回调或显示表面更新间隔的第 95 百分位，单位为微秒。
 

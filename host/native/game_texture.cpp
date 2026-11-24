@@ -4,6 +4,9 @@
 #include <wrl/client.h>
 #include <new>
 #include <memory>
+#include <algorithm>
+#include <array>
+#include <utility>
 using Microsoft::WRL::ComPtr;
 namespace fl = frame_link;
 
@@ -111,25 +114,25 @@ extern "C" int lan_game_acquire(void *opaque) {
         fl::read(c->ready) != r.token || fl::read(c->error) || fl::read(c->active_mode) != r.mode)
         return -2;
     fl::put(c->heartbeat, static_cast<LONG64>(GetTickCount64()));
-    int best = -1;
-    auto latest = r.last;
-    for (unsigned i = 0; i < fl::slots; ++i) {
-        auto seq = fl::read(c->frames[i].sequence);
-        if (seq > latest) {
-            latest = seq;
-            best = i;
-        }
+    std::array<std::pair<LONG64, unsigned>, fl::slots> candidates;
+    for (unsigned i = 0; i < fl::slots; ++i)
+        candidates[i] = {fl::read(c->frames[i].sequence), i};
+    std::sort(candidates.rbegin(), candidates.rend());
+    for (const auto &[sequence, slot] : candidates) {
+        if (sequence <= r.last)
+            break;
+        // The producer publishes the sequence just before releasing key 1.
+        // A slightly older unread slot can already be ready for this deadline.
+        auto hr = r.keys[slot]->AcquireSync(1, 0);
+        if (hr == WAIT_TIMEOUT)
+            continue;
+        if (hr != S_OK)
+            return -3;
+        r.held = static_cast<int>(slot);
+        r.last = fl::read(c->frames[slot].sequence);
+        return r.held;
     }
-    if (best == -1)
-        return -1;
-    auto hr = r.keys[best]->AcquireSync(1, 0);
-    if (hr == WAIT_TIMEOUT)
-        return -1;
-    if (hr != S_OK)
-        return -3;
-    r.held = best;
-    r.last = fl::read(c->frames[best].sequence);
-    return best;
+    return -1;
 }
 extern "C" int lan_game_release(void *opaque) {
     auto &r = *static_cast<GameReader *>(opaque);

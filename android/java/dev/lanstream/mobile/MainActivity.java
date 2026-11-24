@@ -11,6 +11,7 @@ import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -68,6 +69,7 @@ public final class MainActivity extends Activity {
     private int displayModeBefore;
     private float refreshBefore;
     private boolean displayModeRequested;
+    private WifiManager.WifiLock streamWifiLock;
     private float sourceInsetX, sourceInsetY;
     private String lastPlacement;
     private final Runnable autoRetry = this::connect;
@@ -289,7 +291,19 @@ public final class MainActivity extends Activity {
     }
 
     private void startMedia(long handle, Stream info, int token, Surface destination, boolean owned) {
-        media = new MediaRunner(handle, destination, info.width, info.height, info.fps, muted, info.udpVideo, info.lowLatency, owned,
+        if (info.udpVideo && Build.VERSION.SDK_INT >= 29 && streamWifiLock == null) {
+            WifiManager wifi = getApplicationContext().getSystemService(WifiManager.class);
+            if (wifi != null) {
+                try {
+                    WifiManager.WifiLock lock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "LanStream:video");
+                    lock.acquire();
+                    streamWifiLock = lock;
+                } catch (RuntimeException error) {
+                    Log.w("LanStream", "Wi-Fi low latency mode unavailable", error);
+                }
+            }
+        }
+        media = new MediaRunner(handle, destination, info.width, info.height, info.fps, muted, info.udpVideo, info.lowLatency, info.keyframeFeedback, owned,
             (reason, tcpFallback) -> ui.post(() -> {
                 if (generation != token) return;
                 if (tcpFallback) {
@@ -519,6 +533,10 @@ public final class MainActivity extends Activity {
         ui.removeCallbacks(autoRetry);
         if (overlay != null) overlay.reset();
         if (media != null) media.stop(); else if (session != 0) NativeBridge.close(session);
+        if (streamWifiLock != null) {
+            streamWifiLock.release();
+            streamWifiLock = null;
+        }
         media = null; session = 0; play = null; texture = null; directView = null; overlay = null; stream = null; profile = null; editing = false; connecting = false;
         if (displayModeRequested) {
             displayModeRequested = false;
@@ -591,6 +609,7 @@ public final class MainActivity extends Activity {
         final boolean phoneAspect;
         final boolean udpVideo;
         final boolean lowLatency;
+        final boolean keyframeFeedback;
         Stream(String metadata) throws Exception {
             JSONObject info = new JSONObject(metadata);
             game = info.getString("game_id"); title = info.getString("title"); encoder = info.getString("encoder");
@@ -598,6 +617,7 @@ public final class MainActivity extends Activity {
             phoneAspect = info.getBoolean("phone_aspect");
             udpVideo = info.optBoolean("udp_video");
             lowLatency = info.optBoolean("low_latency");
+            keyframeFeedback = udpVideo && info.optBoolean("keyframe_feedback");
             if (width < 64 || width > 3840 || height < 64 || height > 2160 || fps < 1 || fps > 120) throw new IllegalArgumentException("主机画面参数超出范围");
         }
     }

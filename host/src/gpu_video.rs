@@ -215,6 +215,7 @@ pub struct GpuPicture {
 #[derive(Default)]
 struct Shared {
     stop: AtomicBool,
+    request_idr: AtomicBool,
     content: Mutex<ContentInsets>,
 }
 
@@ -318,6 +319,10 @@ impl GpuVideo {
 
     pub fn content(&self) -> ContentInsets {
         *self.shared.content.lock().unwrap()
+    }
+
+    pub fn request_idr(&self) {
+        self.shared.request_idr.store(true, Ordering::Relaxed);
     }
 
     pub fn pump(
@@ -706,6 +711,9 @@ fn capture(
     let mut stats_at = Instant::now();
     let mut costs = Vec::new();
     let mut max_pending = 0;
+    let mut last_output = Instant::now();
+    let mut max_output_gap = Duration::ZERO;
+    let mut forced_recoveries = 0u32;
     let frame_event = match &input {
         FrameInput::Game(game) => game.event(),
         _ => null_mut(),
@@ -735,6 +743,9 @@ fn capture(
                     })?;
                 }
                 costs.push(done.elapsed.as_micros() as u64);
+                let completed = Instant::now();
+                max_output_gap = max_output_gap.max(completed - last_output);
+                last_output = completed;
                 if done.picture.bytes.is_empty() {
                     need_idr = true;
                 } else if !need_idr || done.idr {
@@ -747,13 +758,17 @@ fn capture(
                 if stats_at.elapsed() >= Duration::from_secs(5) {
                     costs.sort_unstable();
                     println!(
-                        "D3D11 → NVENC ({mode}): {} fps, 采集至取出 p50={}us p95={}us, 峰值在途={max_pending}",
+                        "D3D11 → NVENC ({mode}): {} fps, 采集至取出 p50={}us p95={}us max={}us, 最大输出间隔={}us, 峰值在途={max_pending}, 恢复关键帧={forced_recoveries}",
                         (costs.len() as f64 / stats_at.elapsed().as_secs_f64()).round(),
                         costs[costs.len() / 2],
                         costs[costs.len() * 95 / 100],
+                        costs[costs.len() - 1],
+                        max_output_gap.as_micros(),
                     );
                     costs.clear();
                     max_pending = 0;
+                    max_output_gap = Duration::ZERO;
+                    forced_recoveries = 0;
                     stats_at = Instant::now();
                 }
                 continue;
@@ -799,11 +814,15 @@ fn capture(
             deadline = now;
         }
         deadline += interval;
-        if encoder.submit(slot, index, need_idr, capture_start)? {
+        let requested = shared.request_idr.swap(false, Ordering::Relaxed);
+        if encoder.submit(slot, index, need_idr || requested, capture_start)? {
+            forced_recoveries += u32::from(requested);
             last_sent = Instant::now();
             last_input_slot = slot;
             index = index.wrapping_add(1);
             max_pending = max_pending.max(pending + 1);
+        } else if requested {
+            shared.request_idr.store(true, Ordering::Relaxed);
         }
         if let Some(probe) = &mut probe
             && sampled.elapsed() >= Duration::from_millis(210)

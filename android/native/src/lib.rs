@@ -89,7 +89,7 @@ impl Client {
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(9)))?;
         let mut kind = receive(&mut reader.socket, &mut reader.buffer, 8192)?;
-        let datagrams = if kind == UDP_OFFER && fast_video {
+        let mut datagrams = if kind == UDP_OFFER && fast_video {
             let lane = Datagrams::accept(ip, &reader.buffer[1..]);
             send(
                 &mut reader.socket.get_ref(),
@@ -123,8 +123,15 @@ impl Client {
                 }
             }
         });
-        let axes = serde_json::from_str::<stream_wire::StreamInfo>(&info)
-            .ok()
+        let capabilities = serde_json::from_str::<stream_wire::StreamInfo>(&info).ok();
+        if let Some(lane) = datagrams.as_mut()
+            && capabilities
+                .as_ref()
+                .is_some_and(|info| info.keyframe_feedback)
+        {
+            lane.video.set_reorder_grace(Duration::from_millis(8));
+        }
+        let axes = capabilities
             .filter(|info| info.udp_axes)
             .and_then(|_| datagrams.as_ref())
             .and_then(|lane| {
@@ -346,6 +353,20 @@ pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_info(
     client(id)
         .and_then(|client| env.new_string(&client.info).ok())
         .map_or(null_mut(), JString::into_raw)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_lanstream_mobile_NativeBridge_requestIdr(
+    _env: JNIEnv,
+    _class: JClass,
+    id: jlong,
+) {
+    if let Some(client) = client(id) {
+        // The receiver retries while waiting. Congestion here must not close the session.
+        let _ = client
+            .commands
+            .try_send((stream_wire::REQUEST_IDR, Vec::new()));
+    }
 }
 
 #[unsafe(no_mangle)]

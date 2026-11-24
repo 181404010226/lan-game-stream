@@ -3,10 +3,37 @@ use crate::window::Target;
 use socket2::{SockRef, Socket};
 use std::io::{self, ErrorKind};
 use std::net::{Shutdown, TcpStream, UdpSocket};
+use std::os::windows::io::AsRawSocket;
+use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use stream_wire::{UDP_OFFER, UDP_READY, nonce, receive, send, udp};
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::NetworkManagement::QoS::{
+    QOS_NON_ADAPTIVE_FLOW, QOS_VERSION, QOSAddSocketToFlow, QOSCloseHandle, QOSCreateHandle,
+    QOSRemoveSocketFromFlow, QOSTrafficTypeAudioVideo,
+};
+
+pub struct VideoQos<'a> {
+    handle: HANDLE,
+    socket: &'a UdpSocket,
+    flow: u32,
+}
+
+impl Drop for VideoQos<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            QOSRemoveSocketFromFlow(
+                self.handle,
+                self.socket.as_raw_socket() as usize,
+                self.flow,
+                0,
+            );
+            QOSCloseHandle(self.handle);
+        }
+    }
+}
 
 pub struct FastVideo {
     socket: UdpSocket,
@@ -95,16 +122,54 @@ impl FastVideo {
         Ok(if result[1..] == [1] { connected } else { None })
     }
 
+    pub fn video_qos(&self) -> Option<VideoQos<'_>> {
+        if self.socket.peer_addr().ok()?.ip().is_loopback() {
+            return None;
+        }
+        let version = QOS_VERSION {
+            MajorVersion: 1,
+            MinorVersion: 0,
+        };
+        let mut handle = null_mut();
+        let mut flow = 0;
+        unsafe {
+            if QOSCreateHandle(&version, &mut handle) == 0 {
+                return None;
+            }
+            if QOSAddSocketToFlow(
+                handle,
+                self.socket.as_raw_socket() as usize,
+                null(),
+                QOSTrafficTypeAudioVideo,
+                QOS_NON_ADAPTIVE_FLOW,
+                &mut flow,
+            ) == 0
+            {
+                QOSCloseHandle(handle);
+                return None;
+            }
+        }
+        println!("UDP 视频已启用 Windows 音视频流量优先级");
+        Some(VideoQos {
+            handle,
+            socket: &self.socket,
+            flow,
+        })
+    }
+
     pub fn picture(&self, sequence: u32, bytes: &[u8]) -> io::Result<()> {
         let start = Instant::now();
         let mut sent = 0;
+        let mut batch = 0;
         udp::fragment(self.cookie, sequence, bytes, |packet| {
             self.socket.send(packet)?;
             sent += packet.len();
-            // Spread a large IDR burst over at most three milliseconds.
-            if bytes.len() > 24 * 1024 && sent % (8 * udp::MAX_DATAGRAM) < packet.len() {
-                let wanted =
-                    Duration::from_secs_f64(0.003 * (sent as f64 / bytes.len() as f64).min(1.0));
+            batch += 1;
+            // Pace data and parity together. Short frames go immediately; a large
+            // frame starts immediately and the remaining groups span at most 6 ms.
+            if batch == 6 {
+                batch = 0;
+                let wanted = Duration::from_micros((sent as u64 / 8).min(6000));
                 if let Some(remaining) = wanted.checked_sub(start.elapsed()) {
                     std::thread::sleep(remaining);
                 }

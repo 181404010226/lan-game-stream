@@ -12,6 +12,7 @@ final class NativeBridge {
     static native byte[] read(long session) throws IOException;
     static native byte[] readPicture(long session) throws IOException;
     static native void ping(long session, long timestamp);
+    static native void requestIdr(long session);
     static native void keys(long session, int[] pressed);
     static native void gamepad(long session, int buttons, int x, int y);
     static native void pointer(long session, int action, int x, int y);

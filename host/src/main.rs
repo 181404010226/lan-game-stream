@@ -393,6 +393,7 @@ fn session(
         udp_video: lane.is_some(),
         low_latency,
         udp_axes: axes.is_some(),
+        keyframe_feedback: lane.is_some() && matches!(&started.capture, VideoCapture::Gpu(_)),
     };
     stream(
         &socket,
@@ -554,7 +555,12 @@ fn stream(
                 teardown("UDP input stopped");
             });
         }
-        group.spawn(move || read_controls(socket, target, pad, stop_ref, acknowledgement));
+        let feedback = match &capture {
+            VideoCapture::Gpu(gpu) if info.keyframe_feedback => Some(gpu),
+            _ => None,
+        };
+        group
+            .spawn(move || read_controls(socket, target, pad, stop_ref, acknowledgement, feedback));
         let status = tx.clone();
         if let (VideoCapture::Ffmpeg { capture, first, .. }, Some(stdin)) = (&capture, stdin) {
             group.spawn(move || {
@@ -568,13 +574,31 @@ fn stream(
         let count = &encoded_frames;
         let capture_source = &capture;
         group.spawn(move || {
-            let emit = |index: Option<u32>, encoded: Vec<u8>| {
+            let _qos = lane.as_ref().and_then(fast_video::FastVideo::video_qos);
+            let mut last_datagram_frame = None::<Instant>;
+            let mut last_warning = None::<Instant>;
+            let mut emit = |index: Option<u32>, encoded: Vec<u8>| {
                 if stop_ref.load(Ordering::Relaxed) {
                     bail!("会话已结束");
                 }
                 let sequence = count.fetch_add(1, Ordering::Relaxed);
                 if let Some(lane) = &lane {
+                    let started = Instant::now();
                     lane.picture(index.unwrap_or(sequence), &encoded)?;
+                    let sent = Instant::now();
+                    let cost = sent - started;
+                    let gap = last_datagram_frame.map_or(cost, |previous| sent - previous);
+                    if gap > Duration::from_millis(50)
+                        && last_warning.is_none_or(|last| sent - last >= Duration::from_secs(1))
+                    {
+                        println!(
+                            "UDP 发送长间隔 seq={sequence} gap={}us send={}us",
+                            gap.as_micros(),
+                            cost.as_micros()
+                        );
+                        last_warning = Some(sent);
+                    }
+                    last_datagram_frame = Some(sent);
                 } else {
                     tx.send((VIDEO, encoded))
                         .map_err(|_| anyhow!("会话已结束"))?;
@@ -677,14 +701,24 @@ fn read_controls(
     pad: Option<Arc<Mutex<Gamepad>>>,
     stop: &AtomicBool,
     acknowledgement: SyncSender<(u8, Vec<u8>)>,
+    feedback: Option<&gpu_video::GpuVideo>,
 ) {
     let mut controls = GameInput::new(target);
     let mut input = BufReader::new(socket);
     let mut buffer = Vec::new();
+    let mut last_request = None::<Instant>;
     while !stop.load(Ordering::Relaxed) {
         match receive(&mut input, &mut buffer, MAX_CONTROL) {
             Ok(KEYS) => controls.apply_keys(&buffer[1..]),
             Ok(POINTER) => controls.pointer(&buffer[1..]),
+            Ok(stream_wire::REQUEST_IDR) if buffer.len() == 1 => {
+                if let Some(gpu) = feedback
+                    && last_request.is_none_or(|last| last.elapsed() >= Duration::from_millis(65))
+                {
+                    gpu.request_idr();
+                    last_request = Some(Instant::now());
+                }
+            }
             Ok(PING) if buffer.len() == 9 => {
                 let _ = acknowledgement.try_send((PONG, buffer[1..].to_vec()));
             }

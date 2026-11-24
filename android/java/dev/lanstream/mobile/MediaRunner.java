@@ -27,11 +27,12 @@ final class MediaRunner {
     private final int width, height, fps;
     private final boolean udpVideo;
     private final boolean immediate;
+    private final boolean keyframeFeedback;
     private final boolean ownsSurface;
     private final Observer observer;
     private final PictureBounds pictureBounds;
     private final ArrayBlockingQueue<byte[]> audio = new ArrayBlockingQueue<>(7);
-    private final ArrayBlockingQueue<Picture> video = new ArrayBlockingQueue<>(9);
+    private final ArrayBlockingQueue<Picture> video;
     private final FrameClock clock;
     private final AtomicBoolean active = new AtomicBoolean(true);
     private volatile boolean muted;
@@ -39,22 +40,29 @@ final class MediaRunner {
     private long lastStats;
     private int rendered;
     private long previousSequence = -1;
-    private boolean resync;
-    private long resyncSince;
+    private boolean resync = true;
+    private long resyncSince, lastIdrRequest, longestRecovery;
+    private int idrRequests, recoveries;
     private long displayStart, lastDisplay;
     private int displayed, longGaps;
     private final long[] displayIntervals = new long[1024];
     private int intervalCount;
     private long receiveStart, missingFrames;
     private int receivedFrames, queueDrops;
+    private long lastReceive, maxReceiveGap;
+    private int maxQueueDepth;
 
-    MediaRunner(long session, Surface surface, int width, int height, int fps, boolean muted, boolean udpVideo, boolean immediate, boolean ownsSurface, Observer observer, PictureBounds pictureBounds) {
+    MediaRunner(long session, Surface surface, int width, int height, int fps, boolean muted, boolean udpVideo, boolean immediate, boolean keyframeFeedback, boolean ownsSurface, Observer observer, PictureBounds pictureBounds) {
         this.session = session; this.surface = surface; this.width = width; this.height = height; this.fps = fps;
         this.observer = observer; this.muted = muted;
         this.pictureBounds = pictureBounds;
         this.udpVideo = udpVideo;
         this.immediate = immediate;
+        this.keyframeFeedback = keyframeFeedback;
         this.ownsSurface = ownsSurface;
+        // Admit a short arrival burst without forcing an otherwise intact GOP to restart.
+        // The consumer never waits for this queue to fill.
+        video = new ArrayBlockingQueue<>(immediate ? Math.max(9, fps / 4 + 3) : 9);
         clock = new FrameClock(fps);
     }
 
@@ -147,33 +155,55 @@ final class MediaRunner {
 
     private void submit(byte[] packet, int offset, long sequence) {
         long submittedAt = System.nanoTime();
+        if (lastReceive != 0) maxReceiveGap = Math.max(maxReceiveGap, submittedAt - lastReceive);
+        lastReceive = submittedAt;
         if (receiveStart == 0) receiveStart = submittedAt;
         receivedFrames++;
         if (sequence != previousSequence + 1) {
             missingFrames += Math.max(0, sequence - previousSequence - 1);
-            video.clear();
             resync = true;
         }
         previousSequence = sequence;
         long timestamp = sequence * 1_000_000L / fps;
-        if (!resync && !video.offer(new Picture(packet, offset, timestamp, false))) {
-            queueDrops++;
+        int queued = video.size();
+        maxQueueDepth = Math.max(maxQueueDepth, queued);
+        boolean lookForIdr = resync || (immediate && queued >= 4) || video.remainingCapacity() == 0;
+        if (lookForIdr && isIdr(packet, offset)) {
+            // Pictures already queued before a loss are still decodable. Keep them
+            // playing until an independent picture is available to replace the queue.
             video.clear();
-            resync = true;
-        }
-        if (resync && isIdr(packet, offset)) {
             video.offer(new Picture(packet, offset, timestamp, true));
             resync = false;
+            if (resyncSince != 0) {
+                recoveries++;
+                longestRecovery = Math.max(longestRecovery, submittedAt - resyncSince);
+            }
+            resyncSince = 0;
+        } else if (!resync && !video.offer(new Picture(packet, offset, timestamp, false))) {
+            queueDrops++;
+            resync = true;
+        }
+        if (resync) {
+            if (resyncSince == 0) resyncSince = submittedAt;
+            if (keyframeFeedback && (lastIdrRequest == 0 || submittedAt - lastIdrRequest >= 80_000_000L)) {
+                NativeBridge.requestIdr(session);
+                lastIdrRequest = submittedAt;
+                idrRequests++;
+            }
+            if (udpVideo && submittedAt - resyncSince > 950_000_000L) end("正在切换到可靠视频连接…", true);
         }
         if (submittedAt - receiveStart >= 5_000_000_000L) {
             int rate = (int)Math.round(receivedFrames * 1_000_000_000.0 / (submittedAt - receiveStart));
-            Log.i("LanStream", "Receive fps " + rate + " missing=" + missingFrames + " queue-overruns=" + queueDrops);
+            Log.i("LanStream", "Receive fps " + rate + " missing=" + missingFrames + " queue-overruns=" + queueDrops
+                + " idr-requests=" + idrRequests + " recoveries=" + recoveries + " max-recovery-us=" + longestRecovery / 1000
+                + " max-receive-gap-us=" + maxReceiveGap / 1000 + " max-queue=" + maxQueueDepth);
             receiveStart = submittedAt;
             missingFrames = receivedFrames = queueDrops = 0;
+            idrRequests = recoveries = 0;
+            longestRecovery = 0;
+            maxReceiveGap = 0;
+            maxQueueDepth = 0;
         }
-        if (!resync) { resyncSince = 0; return; }
-        if (resyncSince == 0) resyncSince = submittedAt;
-        else if (udpVideo && submittedAt - resyncSince > 950_000_000L) end("正在切换到可靠视频连接…", true);
     }
 
     void displayedFrame(long now) {
@@ -189,8 +219,9 @@ final class MediaRunner {
         if (now - displayStart >= 5_000_000_000L) {
             Arrays.sort(displayIntervals, 0, intervalCount);
             long p95Us = intervalCount == 0 ? 0 : displayIntervals[(intervalCount * 95 - 1) / 100] / 1000;
+            long maxUs = intervalCount == 0 ? 0 : displayIntervals[intervalCount - 1] / 1000;
             Log.i("LanStream", "Display fps " + Math.round(displayed * 1_000_000_000.0 / (now - displayStart))
-                + " gaps=" + longGaps + " p95-gap-us=" + p95Us);
+                + " gaps=" + longGaps + " p95-gap-us=" + p95Us + " max-gap-us=" + maxUs);
             displayStart = now;
             displayed = longGaps = 0;
             intervalCount = 0;
@@ -217,12 +248,14 @@ final class MediaRunner {
                     decoder = openDecoder(picture.packet, picture.offset);
                     if (rendererEvents != null) decoder.setOnFrameRenderedListener((codec, pts, time) -> displayedFrame(time), new Handler(rendererEvents.getLooper()));
                 }
-                else if (picture.reset) { decoder.flush(); clock.reset(); }
-                int slot;
-                do {
-                    slot = decoder.dequeueInputBuffer(8000);
-                    if (slot < 0) drain(decoder, output);
-                } while (slot < 0 && active.get());
+                // The host repeats SPS/PPS on IDRs. An IDR starts a fresh reference
+                // chain in this stream without flushing the running hardware codec.
+                else if (picture.reset) { clock.reset(); }
+                int slot = decoder.dequeueInputBuffer(0);
+                while (slot < 0 && active.get()) {
+                    drain(decoder, output);
+                    slot = decoder.dequeueInputBuffer(immediate ? 2000 : 8000);
+                }
                 if (slot < 0 || !active.get()) break;
                 ByteBuffer input = decoder.getInputBuffer(slot);
                 int length = picture.packet.length - picture.offset;
@@ -279,9 +312,12 @@ final class MediaRunner {
             MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024);
             format.setInteger(MediaFormat.KEY_PRIORITY, 0);
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps);
-            if (Build.VERSION.SDK_INT >= 30 && codec.getCodecInfo().getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
+            MediaCodecInfo.CodecCapabilities capabilities = codec.getCodecInfo().getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC);
+            int catchUpRate = Math.min(120, fps * 2);
+            int operatingRate = immediate && capabilities.getVideoCapabilities().areSizeAndRateSupported(width, height, catchUpRate)
+                ? catchUpRate : fps;
+            format.setInteger(MediaFormat.KEY_OPERATING_RATE, operatingRate);
+            if (Build.VERSION.SDK_INT >= 30 && capabilities.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
             }
             int nalu = start(first, offset);
@@ -298,7 +334,7 @@ final class MediaRunner {
             }
             codec.configure(format, surface, null, 0);
             codec.start();
-            Log.i("LanStream", "AVC decoder " + codec.getName() + " " + width + "x" + height);
+            Log.i("LanStream", "AVC decoder " + codec.getName() + " " + width + "x" + height + " operating-rate=" + operatingRate);
             return codec;
         } catch (RuntimeException failure) {
             codec.release();
